@@ -66,14 +66,19 @@ from qiskit_machine_learning.utils import algorithm_globals
 # kernel. So n=2 is the meaningful DQC1 setting; use n=3 only to *observe* the
 # concentration effect. For strong higher-dim accuracy use the fidelity kernel
 # (see eval_harness.py).
-algorithm_globals.random_seed = 12345
+SEED = 12345           # RNG seed for reproducible datasets
 N_FEATURES = 2          # number of features / target qubits (ad_hoc supports 2 or 3)
 LAYERS = 2              # l, number of feature-map repetitions
+TRAIN_SIZE = 20         # training points (per class for ad_hoc; total for synthetic)
+TEST_SIZE = 5           # test points (per class for ad_hoc; total for synthetic)
+
+algorithm_globals.random_seed = SEED
 
 if N_FEATURES <= 3:
+    # ad_hoc_data's sizes are PER CLASS, so this yields 2*TRAIN_SIZE / 2*TEST_SIZE points.
     train_features, train_labels, test_features, test_labels, adhoc_total = ad_hoc_data(
-        training_size=20,
-        test_size=5,
+        training_size=TRAIN_SIZE,
+        test_size=TEST_SIZE,
         n=N_FEATURES,
         gap=0.3,
         plot_data=False,
@@ -84,16 +89,17 @@ else:
     from sklearn.datasets import make_classification
     from sklearn.preprocessing import MinMaxScaler
     _X, _y = make_classification(
-        n_samples=50, n_features=N_FEATURES, n_informative=N_FEATURES,
-        n_redundant=0, n_clusters_per_class=1, n_classes=2, random_state=12345,
+        n_samples=TRAIN_SIZE + TEST_SIZE, n_features=N_FEATURES,
+        n_informative=N_FEATURES, n_redundant=0, n_clusters_per_class=1,
+        n_classes=2, random_state=SEED,
     )
     _X = MinMaxScaler((0, 2 * np.pi)).fit_transform(_X)   # scale into gate angles
-    train_features, train_labels = _X[:40], _y[:40]
-    test_features, test_labels = _X[40:], _y[40:]
+    train_features, train_labels = _X[:TRAIN_SIZE], _y[:TRAIN_SIZE]
+    test_features, test_labels = _X[TRAIN_SIZE:], _y[TRAIN_SIZE:]
 
-# 20 samples per label -> 40 training points, 5 per label -> 10 test points.
-n_train = len(train_features)   # 40
-n_test = len(test_features)     # 10
+# Actual point counts (ad_hoc doubles the per-class sizes above).
+n_train = len(train_features)
+n_test = len(test_features)
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +167,7 @@ def dqc1_kernel_value(x_i, x_j):
 
 
 # ---------------------------------------------------------------------------
-# Training Gram matrix (40 x 40)
+# Training Gram matrix (n_train x n_train)
 # ---------------------------------------------------------------------------
 t = time.time()
 k = np.zeros((n_train, n_train))
@@ -176,7 +182,7 @@ print("Diagonal (should be ~1):", np.round(d, 3))
 
 
 # ---------------------------------------------------------------------------
-# Test Gram matrix (10 x 40)
+# Test Gram matrix (n_test x n_train)
 # ---------------------------------------------------------------------------
 t = time.time()
 kt = np.zeros((n_test, n_train))

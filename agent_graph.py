@@ -15,6 +15,8 @@ Run:
     export ANTHROPIC_MODEL=claude-opus-4-8   # a model id your key can access
     export AGENT_DIM=2                        # feature/qubit dimensionality
     export AGENT_KERNEL=fidelity             # 'fidelity' (search) or 'dqc1' (paper)
+    export AGENT_TRAIN_SIZE=20               # training points (per class for ad_hoc)
+    export AGENT_TEST_SIZE=5                 # test points (per class for ad_hoc)
     python agent_graph.py
 
 Every run writes a full transcript (messages, tool calls, results, best-so-far)
@@ -25,6 +27,7 @@ from __future__ import annotations
 
 import os
 import json
+import time
 import datetime
 from typing import Annotated, TypedDict
 
@@ -35,19 +38,22 @@ from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 from dotenv import load_dotenv
 load_dotenv()
-from eval_harness import evaluate_feature_map, load_dataset, SEED_FEATURE_MAP
+from eval_harness import (evaluate_feature_map, load_dataset,
+                          SEED_FEATURE_MAP, seed_library_text)
 
 # NOTE: set ANTHROPIC_MODEL to a model id your API key can access.
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 MAX_ITERS = int(os.environ.get("AGENT_MAX_ITERS", "8"))    # max tool rounds
 DIM = int(os.environ.get("AGENT_DIM", "2"))                # feature/qubit count
 KERNEL = os.environ.get("AGENT_KERNEL", "fidelity")        # 'fidelity' or 'dqc1'
+TRAIN_SIZE = int(os.environ.get("AGENT_TRAIN_SIZE", "20"))  # train points (per class for ad_hoc)
+TEST_SIZE = int(os.environ.get("AGENT_TEST_SIZE", "5"))     # test points (per class for ad_hoc)
 TEMPERATURE = float(os.environ.get("AGENT_TEMPERATURE", "0.1"))
 PLOT = os.environ.get("AGENT_PLOT", "1") != "0"            # save a figure per round
 TARGET_ACC = 1.0
 
 # Load the benchmark once and reuse it for every candidate evaluation.
-DATA = load_dataset(DIM)
+DATA = load_dataset(DIM, train_size=TRAIN_SIZE, test_size=TEST_SIZE)
 
 
 # ---------------------------------------------------------------------------
@@ -143,8 +149,10 @@ sentences maximum. If the candidate errored, state the concrete fix instead."""
 
 
 def agent_node(state: AgentState) -> dict:
+    t0 = time.perf_counter()
     resp = llm.invoke([SystemMessage(content=SYSTEM)] + state["messages"])
-    log(f"AGENT (after {state['iteration']} tool rounds)", _render(resp))
+    dt = time.perf_counter() - t0
+    log(f"AGENT (after {state['iteration']} tool rounds) [llm {dt:.2f}s]", _render(resp))
     return {"messages": [resp]}
 
 
@@ -153,9 +161,12 @@ def tool_node(state: AgentState) -> dict:
     tool_messages, best = [], dict(state["best"])
     for call in last.tool_calls:
         code = call["args"].get("code", "")
+        t0 = time.perf_counter()
         result = evaluate_feature_map(code, data=DATA, kernel=KERNEL,
                                       plot=PLOT, iteration=state["iteration"] + 1)
-        log(f"TOOL RESULT (round {state['iteration'] + 1})",
+        dt = time.perf_counter() - t0
+        result["eval_seconds"] = round(dt, 3)   # let the agent see runtime too
+        log(f"TOOL RESULT (round {state['iteration'] + 1}) [eval {dt:.2f}s]",
             f"code:\n{code}\n\nresult: {json.dumps(result)}")
         if result.get("ok") and result["accuracy"] > best.get("accuracy", -1.0):
             best = {"code": code, "accuracy": result["accuracy"], "metrics": result}
@@ -177,10 +188,12 @@ def review_node(state: AgentState) -> dict:
     else:
         prompt = (f"The candidate errored: {m.get('error')}\n"
                   f"Code:\n```python\n{code}\n```\nGive the concrete fix in one sentence.")
+    t0 = time.perf_counter()
     resp = review_llm.invoke([SystemMessage(content=REVIEWER_SYSTEM),
                               HumanMessage(content=prompt)])
+    dt = time.perf_counter() - t0
     note = resp.content if isinstance(resp.content, str) else _render(resp)
-    log(f"REVIEW (round {state['iteration']})", note)
+    log(f"REVIEW (round {state['iteration']}) [llm {dt:.2f}s]", note)
     return {"messages": [HumanMessage(content=f"Reviewer feedback: {note}")]}
 
 
@@ -213,20 +226,25 @@ def build_graph():
 if __name__ == "__main__":
     log("RUN CONFIG",
         f"model={MODEL} dim={DIM} kernel={KERNEL} max_iters={MAX_ITERS} "
-        f"temperature={TEMPERATURE}\ntrain/test points: {len(DATA[0])}/{len(DATA[2])}")
+        f"temperature={TEMPERATURE}\n"
+        f"train_size={TRAIN_SIZE} test_size={TEST_SIZE} "
+        f"(actual train/test points: {len(DATA[0])}/{len(DATA[2])})")
 
     first_message = HumanMessage(content=(
-        "Design and iteratively improve the feature map. Start from this baseline "
-        "(the paper's ZZ feature map) and try to beat it:\n"
-        f"```python\n{SEED_FEATURE_MAP.strip()}\n```\n"
-        "Call evaluate_feature_map_tool with your first candidate now."
+        "Design and iteratively improve the feature map. Here is a library of "
+        "seed feature maps you may start from, adapt, or combine:\n\n"
+        f"{seed_library_text()}\n\n"
+        "Pick or adapt one, then call evaluate_feature_map_tool with your first "
+        "candidate. Try to beat the best of these baselines."
     ))
 
+    run_t0 = time.perf_counter()
     app = build_graph()
     final = app.invoke(
         {"messages": [first_message], "iteration": 0, "best": {"accuracy": -1.0}},
         {"recursion_limit": 100},
     )
+    log("TOTAL RUNTIME", f"{time.perf_counter() - run_t0:.2f}s over {final['iteration']} rounds")
 
     best = final["best"]
     log("BEST RESULT", json.dumps(best, indent=2))

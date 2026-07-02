@@ -47,30 +47,38 @@ from qiskit_machine_learning.utils import algorithm_globals
 # ---------------------------------------------------------------------------
 # Datasets
 # ---------------------------------------------------------------------------
-def load_adhoc(seed: int = 12345, n: int = 2):
-    """ad_hoc dataset with n features (ad_hoc_data supports n in {2, 3})."""
+def load_adhoc(seed: int = 12345, n: int = 2, train_size: int = 20, test_size: int = 5):
+    """ad_hoc dataset with n features (ad_hoc_data supports n in {2, 3}).
+
+    train_size / test_size are per-class sample counts (ad_hoc_data's convention),
+    so the returned sets hold 2*train_size / 2*test_size points total.
+    """
     algorithm_globals.random_seed = seed
     Xtr, ytr, Xte, yte, _ = ad_hoc_data(
-        training_size=20, test_size=5, n=n, gap=0.3,
+        training_size=train_size, test_size=test_size, n=n, gap=0.3,
         plot_data=False, one_hot=False, include_sample_total=True,
     )
     return Xtr, ytr, Xte, yte
 
 
-def load_dataset(n: int = 2, seed: int = 12345):
+def load_dataset(n: int = 2, seed: int = 12345, train_size: int = 20, test_size: int = 5):
     """n-feature binary dataset scaled to [0, 2*pi] (gate-angle range).
 
     Uses the paper's ad_hoc set for n in {2, 3}; for n >= 4 (where ad_hoc is
     unsupported) it falls back to a synthetic sklearn dataset.
+
+    train_size / test_size set the number of training / test points. For the
+    ad_hoc path they are per-class counts (see load_adhoc); for the synthetic
+    fallback they are the total number of points in each split.
     """
     if n <= 3:
-        return load_adhoc(seed, n)
+        return load_adhoc(seed, n, train_size, test_size)
     X, y = make_classification(
-        n_samples=50, n_features=n, n_informative=n, n_redundant=0,
-        n_clusters_per_class=1, n_classes=2, random_state=seed,
+        n_samples=train_size + test_size, n_features=n, n_informative=n,
+        n_redundant=0, n_clusters_per_class=1, n_classes=2, random_state=seed,
     )
     X = MinMaxScaler((0, 2 * np.pi)).fit_transform(X)
-    return X[:40], y[:40], X[40:], y[40:]
+    return X[:train_size], y[:train_size], X[train_size:], y[train_size:]
 
 
 # ---------------------------------------------------------------------------
@@ -245,8 +253,14 @@ def evaluate_feature_map(code: str, data=None, device: str | None = None,
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
-# Example feature map to seed the agent (the paper's ZZ-style l=2 map, n-D)
-SEED_FEATURE_MAP = """
+# ---------------------------------------------------------------------------
+# Seed feature maps: a library the agent can start from / draw ideas from.
+# Add new ones by dropping another entry into SEED_FEATURE_MAPS -- each value is
+# a string defining build_circuit(x) under the same contract as agent code.
+# ---------------------------------------------------------------------------
+SEED_FEATURE_MAPS = {
+    # The paper's ZZ-style l=2 map (first + second order, full entanglement).
+    "zz_l2": """
 def build_circuit(x):
     n = len(x)
     qc = QuantumCircuit(n)
@@ -260,9 +274,44 @@ def build_circuit(x):
                 qc.rz(2 * (np.pi - x[i]) * (np.pi - x[j]), j)
                 qc.cx(i, j)
     return qc
-"""
+""",
+    # First-order only (Z feature map): cheap baseline, no entanglement.
+    "z_first_order": """
+def build_circuit(x):
+    n = len(x)
+    qc = QuantumCircuit(n)
+    for i in range(n):
+        qc.h(i)
+        qc.rz(2 * x[i], i)
+    return qc
+""",
+    # Data re-uploading with a linear CNOT chain and RY/RZ rotations.
+    "reupload_ring": """
+def build_circuit(x):
+    n = len(x)
+    qc = QuantumCircuit(n)
+    for _ in range(3):                     # 3 re-uploading blocks
+        for i in range(n):
+            qc.ry(2 * x[i], i)
+            qc.rz(2 * x[i], i)
+        for i in range(n):
+            qc.cx(i, (i + 1) % n)          # ring of CNOTs
+    return qc
+""",
+}
+
+# Backwards-compatible default seed.
+SEED_FEATURE_MAP = SEED_FEATURE_MAPS["zz_l2"]
+
+
+def seed_library_text() -> str:
+    """Render the seed library as a prompt-ready block."""
+    blocks = []
+    for name, code in SEED_FEATURE_MAPS.items():
+        blocks.append(f"### {name}\n```python\n{code.strip()}\n```")
+    return "\n\n".join(blocks)
 
 
 if __name__ == "__main__":
-    for n in (2, 3, 4):
-        print(f"n={n}:", evaluate_feature_map(SEED_FEATURE_MAP, data=load_dataset(n)))
+    for name, code in SEED_FEATURE_MAPS.items():
+        print(f"[{name}]", evaluate_feature_map(code, data=load_dataset(2)))
