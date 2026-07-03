@@ -33,7 +33,7 @@ matplotlib.use("Agg")            # headless: save figures to disk, never open a 
 import matplotlib.pyplot as plt
 
 from qiskit import QuantumCircuit, transpile
-from qiskit.quantum_info import Statevector, DensityMatrix, partial_trace
+from qiskit.quantum_info import Statevector, DensityMatrix, partial_trace, Operator
 
 from sklearn import svm
 from sklearn.metrics import accuracy_score
@@ -227,8 +227,14 @@ def evaluate_feature_map(code: str, data=None, device: str | None = None,
             Ktr = np.abs(S_tr.conj() @ S_tr.T) ** 2
             Kte = np.abs(S_te.conj() @ S_tr.T) ** 2
         elif kernel == "dqc1":
-            Ktr = np.array([[dqc1_kernel_value(build_circuit, a, b) for b in Xtr] for a in Xtr])
-            Kte = np.array([[dqc1_kernel_value(build_circuit, a, b) for b in Xtr] for a in Xte])
+            # K(x, x') = |tr(u(x) u(x')^dag)| / 2^n = |<u(x'), u(x)>_HS| / 2^n.
+            # Vectorized: precompute each unitary once, then one batched matmul --
+            # far faster than building N^2 Hadamard-test density matrices.
+            n = probe.num_qubits
+            U_tr = np.array([Operator(build_circuit(x)).data.ravel() for x in Xtr])
+            U_te = np.array([Operator(build_circuit(x)).data.ravel() for x in Xte])
+            Ktr = np.abs(U_tr @ U_tr.conj().T) / (2 ** n)
+            Kte = np.abs(U_te @ U_tr.conj().T) / (2 ** n)
         else:
             raise ValueError(f"unknown kernel: {kernel!r} (use 'fidelity' or 'dqc1')")
 
