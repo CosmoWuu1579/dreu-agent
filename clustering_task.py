@@ -17,8 +17,15 @@ DQC1_COMP_RANK, DQC1_EXACT_*, RANDOM_STATE, ...). New knobs:
                       (default "spirals"; e.g. "spirals+moons+circles")
     CLUSTER_N_POINTS  points per dataset (default 60 -- the DQC1 kernel is
                       O(N^2) statevector simulations, keep this small)
-    CLUSTER_VARIANT   "pre"  = init + DeltaH assignment only (DQC1-pre)
-                      "full" = + reduction + K* selection    (DQC1-full)
+    CLUSTER_VARIANT   "full" (default) = init + DeltaH + reduction + K*
+                      "pre"            = init + DeltaH assignment only
+
+    CAUTION on "pre": at small N with the default INIT_CLUSTERS/N_INIT,
+    dqc1.py's seed-growth loop (pure Euclidean nearest-neighbor) can consume
+    every point before the kernel-dependent DeltaH step runs -- then the score
+    is IDENTICAL for every feature map and the search objective is flat
+    (verified at N=24 and N=60). "full" always depends on the kernel through
+    the reduction/reassignment step, so it is the default for discovery.
 """
 
 from __future__ import annotations
@@ -47,7 +54,7 @@ from DiscoveryTask import DiscoveryTask
 
 CLUSTER_DATASETS = os.environ.get("CLUSTER_DATASETS", "spirals")
 CLUSTER_N_POINTS = int(os.environ.get("CLUSTER_N_POINTS", 60))
-CLUSTER_VARIANT = os.environ.get("CLUSTER_VARIANT", "pre").strip().lower()
+CLUSTER_VARIANT = os.environ.get("CLUSTER_VARIANT", "full").strip().lower()
 
 # The DQC1 kernel circuit holds 2n+1 qubits (probe + system + purification),
 # so cap the feature-map width to keep each kernel entry cheap to simulate.
@@ -249,6 +256,67 @@ def build_circuit(x):
                                     + 0.1 * (x[i] ** 2 + x[j] ** 2)), i, j)
     return qc
 """,
+    # ---- new maps from new_feature_maps.py (Colab sweep), L=1 as used there --
+    # Pauli-XZ (fm_pauli_xz): RX/RZ(x^2) fields + X_i Z_j coupling via H-RZZ-H
+    "pauli_xz": """
+def build_circuit(x):
+    n = len(x)
+    qc = QuantumCircuit(n)
+    qc.h(range(n))
+    for i in range(n):
+        qc.rx(2 * np.pi * x[i], i)
+        qc.rz(2 * np.pi * x[i] ** 2, i)
+    for i in range(n):
+        for j in range(i + 1, n):
+            qc.h(i)
+            qc.rzz(2 * np.pi * x[i] * x[j], i, j)
+            qc.h(i)
+    return qc
+""",
+    # IQP-style (fm_iqp): H layer inside the loop, then Z + ZZ phases
+    "iqp": """
+def build_circuit(x):
+    n = len(x)
+    qc = QuantumCircuit(n)
+    qc.h(range(n))
+    for i in range(n):
+        qc.rz(2 * np.pi * x[i], i)
+    for i in range(n):
+        for j in range(i + 1, n):
+            qc.rzz(2 * np.pi * x[i] * x[j], i, j)
+    return qc
+""",
+    # Trotterized Hamiltonian (fm_hamiltonian):
+    # H(x) = sum_i x_i Z_i + x_i^2 X_i + x_i x_{i+1} Z_i Z_{i+1}
+    "hamiltonian_trotter": """
+def build_circuit(x):
+    n = len(x)
+    qc = QuantumCircuit(n)
+    for i in range(n):
+        qc.rz(2 * np.pi * x[i], i)
+        qc.rx(2 * np.pi * x[i] ** 2, i)
+    for i in range(n - 1):
+        qc.rzz(2 * np.pi * x[i] * x[i + 1], i, i + 1)
+    return qc
+""",
+    # Random kitchen sinks (fm_random_kitchen_sinks): fixed-seed random
+    # frequencies/phases per qubit -> deterministic across calls
+    "random_kitchen_sinks": """
+def build_circuit(x):
+    n = len(x)
+    rng = np.random.default_rng(123)
+    w_rx = rng.normal(size=n); b_rx = rng.uniform(0, 2 * np.pi, size=n)
+    w_ry = rng.normal(size=n); b_ry = rng.uniform(0, 2 * np.pi, size=n)
+    w_rz = rng.normal(size=n); b_rz = rng.uniform(0, 2 * np.pi, size=n)
+    qc = QuantumCircuit(n)
+    for i in range(n):
+        qc.rx(2 * np.pi * w_rx[i] * x[i] + b_rx[i], i)
+        qc.ry(2 * np.pi * w_ry[i] * x[i] + b_ry[i], i)
+        qc.rz(2 * np.pi * w_rz[i] * x[i] + b_rz[i], i)
+    for i in range(n - 1):
+        qc.cx(i, i + 1)
+    return qc
+""",
 }
 
 
@@ -319,10 +387,14 @@ def make_clustering_task(datasets: str = CLUSTER_DATASETS,
     data = load_cluster_datasets(datasets, n_points)
 
     def _evaluate(code: str, *args, **kwargs) -> dict:
+        # figures live in the task's per-run folder, next to the transcript
+        # (`task` is bound below, before the first evaluation runs); plots/
+        # subfolder matches qml_task.py's convention
+        kwargs.setdefault("plot_dir", os.path.join(task.run_dir, "plots"))
         return evaluate_clustering(code, datasets=data, variant=variant,
                                    *args, **kwargs)
 
-    return DiscoveryTask(
+    task = DiscoveryTask(
         name=f"dqc1_clustering_{'_'.join(data)}_{variant}",
         system_prompts=_system_prompts(list(data), variant),
         seeds={"cluster_feature_map": SEED_CLUSTER_FEATURE_MAPS},
@@ -334,6 +406,7 @@ def make_clustering_task(datasets: str = CLUSTER_DATASETS,
         ],
         documentation_source="qiskit (QuantumCircuit API)",
     )
+    return task
 
 
 if __name__ == "__main__":

@@ -47,9 +47,12 @@ class DiscoveryTask:
         self._documentation_source = documentation_source
         self._retriever = retriever            # RAG over knowledge_sources (papers)
         self._doc_retriever = doc_retriever    # RAG over documentation (API docs)
-        os.makedirs(log_dir, exist_ok=True)
+        # one folder per run: runs/<name>_<stamp>/ holds transcript, notes,
+        # plots -- everything the run produces
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_path = os.path.join(log_dir, f"{name}_{stamp}.txt")
+        self.run_dir = os.path.join(log_dir, f"{name}_{stamp}")
+        os.makedirs(self.run_dir, exist_ok=True)
+        self.log_path = os.path.join(self.run_dir, "transcript.txt")
 
     # --- 1. system prompt, keyed by which agent role is asking ---------------
     def system_prompt(self, agent_type: str = "generate", **fmt) -> str:
@@ -103,6 +106,7 @@ class DiscoveryTask:
 
     # --- 6. logging ----------------------------------------------------------
     def log(self, section: str, text: str = "") -> None:
+        os.makedirs(self.run_dir, exist_ok=True)  # survive a vanished folder
         block = f"\n{'=' * 72}\n[{self.name}] {section}\n{'=' * 72}\n{text}\n"
         with open(self.log_path, "a", encoding="utf-8") as f:
             f.write(block)

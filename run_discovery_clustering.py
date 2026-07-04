@@ -8,7 +8,10 @@ DQC1 normalized-trace kernel of dqc1.py and the objective is mean ARI).
     export AGENT_MODEL=claude-opus-4-8      # any init_chat_model id
     export CLUSTER_DATASETS=spirals         # "spirals+moons+circles", ...
     export CLUSTER_N_POINTS=60              # kernel is O(N^2); keep small
-    export CLUSTER_VARIANT=pre              # "pre" (DQC1-pre) or "full" (DQC1-full)
+    export CLUSTER_VARIANT=full             # "full" (DQC1-full; default) or "pre"
+                                            # NOTE: "pre" can be feature-map
+                                            # INSENSITIVE at small N (see
+                                            # clustering_task.py docstring)
     python run_discovery_clustering.py
 
 dqc1.py's own knobs (INIT_CLUSTERS, N_INIT, DATA_NOISE, DQC1_COMP_RANK, ...)
@@ -49,7 +52,7 @@ def build_pipeline() -> AgentPipeline:
                                 n_points=CLUSTER_N_POINTS,
                                 variant=CLUSTER_VARIANT)
 
-    # ---- optional research tools (same placeholders as run_discovery.py) ----
+    # ---- optional tools the nodes may call (any can be omitted) ----
     @tool
     def documentation_lookup(query: str) -> str:
         """Look up quantum-library API documentation relevant to `query`."""
@@ -71,8 +74,8 @@ def build_pipeline() -> AgentPipeline:
             f"(DQC1, Renyi-2). In 2 sentences, advise on: {topic}")
         return msg.content if isinstance(msg.content, str) else str(msg.content)
 
-    research_tools = [documentation_lookup, past_papers_lookup]
-
+    # research_tools = [documentation_lookup, past_papers_lookup]
+    research_tools = []
     generate_llm = make_llm(temperature=TEMPERATURE, max_tokens=4096)
     explorer_llm = make_llm(temperature=0.5, max_tokens=2048)
     review_llm = make_llm(temperature=0.3, max_tokens=1024)
@@ -97,10 +100,40 @@ def build_pipeline() -> AgentPipeline:
         entry_point="build_circuit",
         translate_spec=TRANSLATE_SPEC or None,
         evaluate_kwargs={"plot": True},    # save a labels figure per evaluation
-        # each evaluation runs the full DQC1 clustering pipeline (slow), so
-        # keep batches small
-        max_variants_per_turn=2,
+        # each trial runs the full DQC1 clustering pipeline (~1 min at the
+        # default 60 points), so keep the per-session scratch budget small
+        max_session_trials=2,
     )
+
+
+def print_seed_baselines(pipeline: AgentPipeline, best: dict) -> None:
+    """Evaluate every seed feature map on the SAME datasets/variant and print
+    a comparison against the agent's best circuit (each row runs the full
+    DQC1 clustering pipeline, so this takes ~1 min per seed)."""
+    task = pipeline.task
+
+    def _row(name: str, m: dict) -> str:
+        if not m.get("ok"):
+            return f"  {name:34s} ERROR: {m.get('error')}"
+        per = "  ".join(
+            f"{d}: ARI={s['ARI']:.3f} (kmeans {s['kmeans_ARI']:.3f})"
+            for d, s in (m.get("per_dataset") or {}).items())
+        return (f"  {name:34s} ari={m['ari']:.4f} nmi={m['nmi']:.4f} "
+                f"gates={m.get('n_gates')} depth={m.get('depth')} | {per}")
+
+    lines = []
+    for name, code in task.seeds().items():
+        # plot=True: each baseline saves a labeled figure into the run's
+        # plots/ folder (clustering_<stamp>_iterseed_<name>.png), so seed
+        # clusterings can be compared visually against the agent's iterN ones
+        lines.append(_row(name, task.evaluate(code, plot=True,
+                                              iteration=f"seed_{name}")))
+    bm = best.get("metrics") or {}
+    if best.get("code") and bm.get("ok"):
+        lines.append(_row(f">> agent best (variant #{best.get('variant', '?')})", bm))
+    report = "\n".join(lines)
+    print(report)
+    task.log("SEED BASELINES", report)   # keep it in the run transcript too
 
 
 if __name__ == "__main__":
@@ -110,7 +143,9 @@ if __name__ == "__main__":
     print("\n" + "=" * 72)
     best = result["best"]
     if best.get("code"):
-        print("BEST FEATURE MAP")
+        print(f"BEST FEATURE MAP -- variant #{best.get('variant', '?')} of "
+              f"{result['iterations']} official variants "
+              f"({result.get('trials', '?')} trials)")
         print("=" * 72)
         print(best["code"].strip())
         print("-" * 72)
@@ -121,4 +156,10 @@ if __name__ == "__main__":
     print("SUMMARY:\n", result["summary"])
     if result.get("translated"):
         print("\nTRANSLATED OUTPUT:\n", result["translated"])
+
+    print("\n" + "=" * 72)
+    print("SEED BASELINES (same datasets, variant & pipeline settings)")
+    print("=" * 72)
+    print_seed_baselines(pipeline, best)
+
     print("\nTranscript:", result["log_path"])

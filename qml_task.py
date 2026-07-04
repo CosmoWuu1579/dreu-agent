@@ -8,6 +8,8 @@ Build one with make_qml_task(dim=..., kernel=...) and hand it to an AgentPipelin
 
 from __future__ import annotations
 
+import os
+
 from DiscoveryTask import DiscoveryTask
 from eval_harness import evaluate_feature_map, load_dataset, SEED_FEATURE_MAPS
 
@@ -42,7 +44,8 @@ def _system_prompts(dim: int) -> dict[str, str]:
             "You are a critical reviewer of quantum feature-map designs for a "
             "quantum-kernel SVM. Given a candidate and its measured accuracy/gate "
             "stats, give ONE specific, actionable improvement (entanglement pattern, "
-            "data re-uploading, encoding rotations, or lower depth). Two sentences max. "
+            "data re-uploading, encoding rotations, or lower depth). Two sentences of feedback, "
+            "plus a brief note of any expert findins worth remembering"
             "If it errored, state the concrete fix."
         ),
         "deploy": (
@@ -55,13 +58,18 @@ def _system_prompts(dim: int) -> dict[str, str]:
 
 def make_qml_task(dim: int = 2, kernel: str = "fidelity",
                   train_size: int = 20, test_size: int = 5) -> DiscoveryTask:
-    data = load_dataset(dim)  # (Xtr, ytr, Xte, yte); train/test sizes fixed in loader
+    train_size = 40
+    test_size = 10
+    data = load_dataset(dim, train_size=train_size, test_size=test_size)  # (Xtr, ytr, Xte, yte); train/test sizes fixed in loader
 
     def _evaluate(code: str, *args, **kwargs) -> dict:
-        # extra *args/**kwargs (e.g. plot=True, iteration=n) flow straight through
+        # extra *args/**kwargs (e.g. plot=True, iteration=n) flow straight through.
+        # Figures default into the task's per-run folder (task exists by the
+        # time this closure is called).
+        kwargs.setdefault("plot_dir", os.path.join(task.run_dir, "plots"))
         return evaluate_feature_map(code, data=data, kernel=kernel, *args, **kwargs)
 
-    return DiscoveryTask(
+    task = DiscoveryTask(
         name=f"qml_feature_map_dim{dim}_{kernel}",
         system_prompts=_system_prompts(dim),
         seeds={"feature_map": SEED_FEATURE_MAPS},
@@ -70,10 +78,11 @@ def make_qml_task(dim: int = 2, kernel: str = "fidelity",
         knowledge_sources=["arXiv:2210.09275", "arXiv:1804.11326 (Havlicek)"],
         documentation_source="qiskit (QuantumCircuit API)",
     )
+    return task
 
 
 if __name__ == "__main__":
-    task = make_qml_task(dim=2)
+    task = make_qml_task(dim=3)
     print(task.describe())
     print("seed types:", task.seed_types())
     seed = next(iter(task.seeds("feature_map").values()))

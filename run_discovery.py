@@ -75,8 +75,8 @@ def build_pipeline() -> AgentPipeline:
             f"You are a QML expert. In 2 sentences, advise on: {topic}")
         return msg.content if isinstance(msg.content, str) else str(msg.content)
 
-    research_tools = [documentation_lookup, past_papers_lookup]
-
+    # research_tools = [documentation_lookup, past_papers_lookup]
+    research_tools = []
     generate_llm = make_llm(temperature=TEMPERATURE, max_tokens=4096)
     explorer_llm = make_llm(temperature=0.5, max_tokens=2048)
     review_llm = make_llm(temperature=0.3, max_tokens=1024)
@@ -106,6 +106,27 @@ def build_pipeline() -> AgentPipeline:
     )
 
 
+def print_seed_baselines(pipeline: AgentPipeline, best: dict) -> None:
+    """Evaluate every seed on the SAME dataset/kernel and print a comparison."""
+    task = pipeline.task
+    lines = []
+    for name, code in task.seeds().items():
+        m = task.evaluate(code)   # no plot=True: no figure spam for baselines
+        if m.get("ok"):
+            lines.append(f"  {name:26s} accuracy={m.get('accuracy'):<8} "
+                         f"gates={m.get('n_gates')} depth={m.get('depth')}")
+        else:
+            lines.append(f"  {name:26s} ERROR: {m.get('error')}")
+    bm = best.get("metrics") or {}
+    if best.get("code") and bm.get("ok"):
+        tag = f">> agent best (variant #{best.get('variant', '?')})"
+        lines.append(f"  {tag:26s} accuracy={bm.get('accuracy'):<8} "
+                     f"gates={bm.get('n_gates')} depth={bm.get('depth')}")
+    report = "\n".join(lines)
+    print(report)
+    task.log("SEED BASELINES", report)   # keep it in the run transcript too
+
+
 if __name__ == "__main__":
     pipeline = build_pipeline()
     result = pipeline.run()
@@ -113,7 +134,9 @@ if __name__ == "__main__":
     print("\n" + "=" * 72)
     best = result["best"]
     if best.get("code"):
-        print("BEST ARTIFACT")
+        print(f"BEST ARTIFACT -- variant #{best.get('variant', '?')} of "
+              f"{result['iterations']} official variants "
+              f"({result.get('trials', '?')} trials)")
         print("=" * 72)
         print(best["code"].strip())
         print("-" * 72)
@@ -124,4 +147,10 @@ if __name__ == "__main__":
     print("SUMMARY:\n", result["summary"])
     if result.get("translated"):
         print("\nTRANSLATED OUTPUT:\n", result["translated"])
+
+    print("\n" + "=" * 72)
+    print("SEED BASELINES (same dataset & kernel)")
+    print("=" * 72)
+    print_seed_baselines(pipeline, best)
+
     print("\nTranscript:", result["log_path"])

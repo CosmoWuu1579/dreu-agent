@@ -15,22 +15,41 @@ Raw threads never leak across channels -- only distilled strings cross over
 (explorer `notes`, evaluation batch summaries, reviewer feedback). So each
 agent sees the others' conclusions, not their plumbing.
 
+TRIALS vs VARIANTS (two separate evaluations):
+
+  trial   : ONE `evaluate` tool call made by the designer -- scratch testing.
+            Runs the evaluator, result comes straight back to generate so it
+            can iterate. Trials never touch best-so-far. Budget of
+            max_session_trials (default 3) per design session.
+  variant : the OFFICIAL score. When the designer submits (a plain reply
+            after >=1 trial, or the budget forces it), the evaluate node
+            RE-RUNS the evaluator on the submitted code and records the
+            result as variant #K. Only variants update best-so-far and
+            `iteration` (max_iters counts variants, not trials).
+
+  What gets submitted: when the budget is spent, the LAST trial's result still
+  goes back to generate with an instruction to analyze everything and present
+  its final design; the code block in that reply is the submission (no block
+  -> the session's BEST trial; ties go to the LATER trial). Only a designer
+  that keeps calling evaluate after being asked to submit is force-submitted.
+  As a final safety net, if the best trial of the whole run still beats the
+  best official variant at deploy time, deploy officially re-evaluates it
+  first -- the best circuit ever tested is never lost.
+
    START -> [explorer <--> explore_tools]        (optional: use_explorer=False
               |  (hand off notes)                 removes it from the graph)
               v
-           generate <--> gen_tools --(research call)--> generate
-              ^  ^   |         |
-              |  |   |         | (evaluate call(s), <= max_variants_per_turn)
-              |  |   |         v
-              |  |   |      evaluate     deterministic: fold batch into best
-              |  |   |         |
-              |  |   |  (not done) | (done)
-              |  +---|-- review <--+   |
-              |      |     |           v
-              +(feedback)--+        deploy -> END
-                     |                 ^
-                     +-----------------+   (plain reply after evaluating:
-                                            "I'm satisfied" -> ship best-so-far)
+           generate <--> gen_tools --(trial results, incl. the last one
+              ^  |              |     + "budget spent, choose")--> generate
+              |  | (plain reply | (kept calling evaluate after being
+              |  |  after >=1   |  asked to submit -> forced)
+              |  |  trial)      v
+              |  +---------> evaluate    OFFICIAL: re-run the evaluator on
+              |                 |        the submitted design -> variant #K
+              |          (not done) | (done)
+              +---- review <--------+   |
+              ^        |                v
+              +(feedback)            deploy -> END
 
   explorer : optional ENTRY. LLM with research tools (web search / docs /
              papers -- all injected, all optional) plus `view_seed_library`.
@@ -40,18 +59,17 @@ agent sees the others' conclusions, not their plumbing.
              notes file -- the explorer's private record -- which the designer
              can read via the `check_explorer_notes` tool.
   generate : LLM with research tools + `view_seed_library` +
-             `check_explorer_notes` (iff the explorer exists) + the evaluate
-             tool. It proposes circuits BY CALLING evaluate -- the tool-call
-             args carry the code -- up to max_variants_per_turn variants per
-             turn. A plain reply after it has evaluated at least once means
-             "done": the graph deploys the best candidate found so far.
-  gen_tools: custom tool executor for the design thread. Evaluate calls run
-             in a for loop that STOPS at the first invalid (errored) variant;
-             every tool_call id still receives a ToolMessage (skipped ones get
-             an explicit marker) so the chat state stays valid.
-  evaluate : DETERMINISTIC record step. The generate LLM already chose what
-             code to run (via its tool calls); this node folds every result of
-             the batch into best-so-far and summarizes it for the reviewer.
+             `check_explorer_notes` (iff the explorer exists) + the trial
+             evaluate tool. It tests circuits BY CALLING evaluate -- the
+             tool-call args carry the code -- iterating trial by trial. A
+             plain reply after >=1 trial means "this is my submission".
+  gen_tools: custom tool executor for the design thread. Trial evaluate calls
+             run in a for loop that STOPS at the first invalid (errored)
+             trial; every tool_call id still receives a ToolMessage (skipped
+             ones get an explicit marker) so the chat state stays valid.
+  evaluate : OFFICIAL evaluation -- no LLM. Re-runs the evaluator on the
+             submitted design and records it as the next variant. The ONLY
+             place best-so-far / iteration are updated. Resets the session.
   review   : LLM critique with its own persistent thread; runs after every
              evaluated batch. Feedback is injected into the design thread.
   deploy   : final summary (+ optional user deploy_prompt + translate LLM).
@@ -78,26 +96,78 @@ from DiscoveryTask import DiscoveryTask
 
 
 class PipelineState(TypedDict, total=False):
-    messages: Annotated[list, add_messages]          # design thread
-    explore_messages: Annotated[list, add_messages]  # explorer's own thread
-    review_messages: Annotated[list, add_messages]   # reviewer's own thread
-    notes: str               # distilled explorer notes handed to the designer
-    iteration: int           # variants evaluated so far
-    current_code: str        # best candidate of the latest batch
+    # --- message channels, one per agent (never mixed) -----------------------
+    messages: Annotated[list, add_messages]
+    #   the DESIGN thread: generate's conversation -- its tool calls, the tool
+    #   results, official-evaluation notices, and reviewer feedback.
+    explore_messages: Annotated[list, add_messages]
+    #   the explorer's private research thread (tool calls + results). Never
+    #   seen by the designer; only `notes` crosses over.
+    review_messages: Annotated[list, add_messages]
+    #   the reviewer's private thread: one (prompt, answer) pair per round, so
+    #   it remembers what it already advised. Tool plumbing is not persisted.
+
+    # --- explorer output ------------------------------------------------------
+    notes: str
+    #   the explorer's accumulated written notes (every round). Injected into
+    #   generate's SYSTEM prompt on every call. Raw tool dumps stay in the
+    #   notes file (readable via the check_explorer_notes tool).
+
+    # --- design-session bookkeeping (reset by the evaluate node) --------------
+    session_trials: int
+    #   how many trial evaluations the designer has used in the CURRENT
+    #   session. Routing reads this: >0 + plain reply -> submit to the
+    #   evaluate node. At >= max_session_trials the designer is ASKED to
+    #   present its final design (one analysis turn); only if it then calls
+    #   evaluate again is submission forced (see force_official). Reset to 0
+    #   after each official evaluation.
+    current_code: str
+    #   the design currently on the table: the BEST-scoring trial of this
+    #   session, overridden by the code block in generate's reply if it
+    #   contains one. THIS is what the evaluate node officially scores.
+    session_best: dict
+    #   {"score", "code", "trial"} of this session's best trial (drives
+    #   current_code); on equal scores the LATER trial wins. Also the FALLBACK
+    #   submission if the designer's chosen code errors in official
+    #   evaluation. Reset by the evaluate node.
+    force_official: bool
+    #   set when the designer was asked to submit (budget spent) but called
+    #   evaluate again anyway -- the router then forces official evaluation.
+    #   Reset by the evaluate node.
+    best_trial: dict
+    #   {"score", "code", "trial", "metrics"} of the best trial of the WHOLE
+    #   run, official or not. If it still beats the official best at deploy
+    #   time, deploy re-evaluates it officially (salvage) before summarizing.
+    gen_no_tool: int
+    #   consecutive generate replies that neither ran a trial nor had anything
+    #   to submit. Guard against a model that only chats: after
+    #   max_gen_no_tool such replies we give up and deploy.
+
+    # --- official results (ONLY the evaluate node writes these) ---------------
+    iteration: int
+    #   official variants recorded so far. max_iters caps this, not trials.
     last_metrics: dict
+    #   metrics of the most recent official variant (what review critiques).
     best: dict
+    #   best official variant so far: {code, <target_metric>, metrics, variant}.
     review: str
-    explore_rounds: int      # explorer<->explore_tools loops (guard)
-    gen_no_tool: int         # consecutive generate turns with no tool call (guard)
+    #   the latest reviewer feedback (after deploy: the final summary).
+    explore_rounds: int
+    #   explorer <-> explore_tools loop count (guard, max_explore_rounds).
 
 
 def _extract_code(text) -> str:
-    """Pull a python code block out of an LLM message (fallback: raw text)."""
+    """Pull the LAST ```python fenced code block out of an LLM message
+    ("" if none).
+
+    Last, not first: a submission reply often recaps earlier attempts before
+    presenting the final design, and the final design comes last. No raw-text
+    fallback: prose must never be mistaken for a submission."""
     if isinstance(text, list):  # structured content blocks (Anthropic, etc.)
         text = "\n".join(b["text"] for b in text
                          if isinstance(b, dict) and b.get("type") == "text")
-    m = re.search(r"```(?:python)?\s*(.*?)```", text or "", re.DOTALL)
-    return (m.group(1) if m else (text or "")).strip()
+    blocks = re.findall(r"```(?:python)?\s*(.*?)```", text or "", re.DOTALL)
+    return blocks[-1].strip() if blocks else ""
 
 
 def _text_of(message) -> str:
@@ -139,7 +209,7 @@ class AgentPipeline:
         max_explore_rounds: int = 4,
         max_gen_no_tool: int = 2,
         max_tool_rounds: int = 3,
-        max_variants_per_turn: int = 3,          # evaluate calls allowed per generate turn
+        max_session_trials: int = 3,             # trial evaluations per design session
     ):
         self.task = task
         self.evaluate_kwargs = evaluate_kwargs or {}
@@ -152,6 +222,9 @@ class AgentPipeline:
         self.explorer_tools = explorer_tools or []
         self.generate_tools = generate_tools or []
         self.review_tools = review_tools or []
+        # global variant counter: every evaluate call gets a number so logs,
+        # review feedback, plot filenames, and the final report line up
+        self._eval_count = 0
         # there is exactly ONE evaluate tool; it always exists (task fallback)
         self.evaluate_tool = evaluate_tool or self._make_evaluate_tool()
         self.evaluate_tool_name = self.evaluate_tool.name
@@ -164,13 +237,17 @@ class AgentPipeline:
         self.max_explore_rounds = max_explore_rounds
         self.max_gen_no_tool = max_gen_no_tool
         self.max_tool_rounds = max_tool_rounds
-        self.max_variants_per_turn = max_variants_per_turn
+        self.max_session_trials = max_session_trials
         # a persistent side-file where explorer notes + tool findings accumulate
-        self.notes_path = os.path.splitext(task.log_path)[0] + "_notes.md"
+        # (lives inside the task's per-run folder, next to the transcript)
+        self.notes_path = os.path.join(task.run_dir, "notes.md")
         # designer-side tool to re-read the notes file (only wired if explorer on)
         self.check_notes_tool = self._make_check_notes_tool()
         # seed reference designs, exposed as a tool (explorer + generate)
         self.seed_library_tool = self._make_seed_library_tool()
+        # last system prompt logged per role, so the transcript records each
+        # system prompt once on first use and again whenever it changes
+        self._logged_systems: dict = {}
 
     # ---------------------------------------------------------------- factory
     @classmethod
@@ -215,22 +292,36 @@ class AgentPipeline:
 
     # ------------------------------------------------------------------ tools
     def _make_evaluate_tool(self):
-        """Default evaluate tool: runs task.evaluate and returns metrics as JSON."""
+        """Default evaluate tool: runs task.evaluate and returns metrics as JSON.
+
+        Every call is stamped with a global `trial` number (also forwarded as
+        `iteration=` to the evaluator, which e.g. tags plot filenames), so
+        every artifact of the run traces back to the trial that produced it."""
         task = self.task
-        kwargs = self.evaluate_kwargs
+        pipeline = self
 
         @tool
         def evaluate(code: str) -> str:
-            """Run one candidate artifact end-to-end and return its metrics as JSON.
+            """Run one TRIAL evaluation of a candidate and return metrics as JSON.
 
             `code` MUST be the full Python source that defines the entry-point
-            function. Call this once per variant you want to test -- you may
-            call it up to 3 times in a single turn to compare architectures.
-            If a variant errors, later variants in the same turn are skipped,
-            so put your most promising candidate first. Returns a JSON object
-            with an "ok" flag plus metrics, or an "error" string.
+            function. Call this one candidate at a time: each result comes back
+            to you, so analyze it before deciding your next trial. You have a
+            limited budget of trials per design session; when it is spent you
+            will be asked to analyze your results and present your final
+            design. You can also stop early: when you are happy with a design,
+            reply WITHOUT calling tools and it is submitted for official
+            evaluation. Returns a JSON object with an "ok" flag, a "trial"
+            number identifying this candidate, plus metrics, or an "error"
+            string.
             """
-            return json.dumps(task.evaluate(code, **kwargs))
+            pipeline._eval_count += 1
+            kwargs = dict(pipeline.evaluate_kwargs)
+            kwargs.setdefault("iteration", pipeline._eval_count)
+            result = task.evaluate(code, **kwargs)
+            if isinstance(result, dict):
+                result.setdefault("trial", pipeline._eval_count)
+            return json.dumps(result)
 
         return evaluate
 
@@ -317,8 +408,16 @@ class AgentPipeline:
         except KeyError:
             return default
 
+    def _log_system(self, role: str, content: str) -> None:
+        """Log a role's system prompt on first use and whenever it changes
+        (e.g. generate's gains the explorer notes after the handoff)."""
+        if self._logged_systems.get(role) != content:
+            self._logged_systems[role] = content
+            self.task.log(f"SYSTEM PROMPT ({role})", content)
+
     def _note(self, section: str, text: str) -> None:
         """Append a finding to the persistent notes file (research storage)."""
+        os.makedirs(os.path.dirname(self.notes_path), exist_ok=True)
         with open(self.notes_path, "a", encoding="utf-8") as f:
             f.write(f"\n## {section}\n{text}\n")
 
@@ -341,7 +440,15 @@ class AgentPipeline:
             out = json.dumps({"ok": False, "error": f"tool raised: {exc}"})
         dt = time.perf_counter() - t0
         out = str(out)
-        self.task.log(f"TOOL {call['name']} [tool {dt:.2f}s]", out[:1500])
+        # log the INPUTS too (e.g. the exact code a trial evaluated), in full --
+        # the transcript is the record of what was actually tested
+        args_lines = []
+        for k, v in (call.get("args") or {}).items():
+            v_str = v if isinstance(v, str) else json.dumps(v)
+            args_lines.append(f"{k}:\n{v_str}" if "\n" in v_str else f"{k}: {v_str}")
+        args_view = "\n".join(args_lines) or "(no args)"
+        self.task.log(f"TOOL {call['name']} [tool {dt:.2f}s]",
+                      f"--- args ---\n{args_view}\n--- result ---\n{out[:1500]}")
         if note:
             self._note(f"TOOL {call['name']}", out[:2000])
         try:
@@ -351,56 +458,48 @@ class AgentPipeline:
         return (ToolMessage(content=out, tool_call_id=call["id"], name=call["name"]),
                 parsed)
 
-    def _find_all_evals(self, messages):
-        """Every (code, metrics) from the latest batch of `evaluate` tool calls.
-
-        Skipped variants (cap exceeded / earlier failure) are excluded -- they
-        were never actually run, so they must not count as iterations.
-        """
-        trigger = None
-        for msg in reversed(messages):
-            if _has_tool_calls(msg):
-                trigger = msg
-                break
-        if trigger is None:
-            return []
-        results_by_id = {m.tool_call_id: m.content
-                         for m in messages if isinstance(m, ToolMessage)}
-        evals = []
-        for call in trigger.tool_calls:
-            if call["name"] != self.evaluate_tool_name:
-                continue
-            code = call["args"].get("code")
-            raw = results_by_id.get(call["id"])
-            try:
-                metrics = json.loads(raw) if raw is not None else {"ok": False, "error": "no result"}
-            except (json.JSONDecodeError, TypeError):
-                metrics = {"ok": False, "error": str(raw)}
-            if isinstance(metrics, dict) and "skipped" in metrics:
-                continue
-            evals.append((code, metrics))
-        return evals
-
     def _run_with_tools(self, llm, tools, messages):
         """Invoke an LLM, servicing any tool calls, until it returns plain text.
 
         Used by the review node (its own small tool loop, separate from the
-        graph's tool-executor nodes)."""
+        graph's tool-executor nodes).
+
+        Every tool result is appended to the conversation BEFORE the next
+        invoke, so the final plain-text reply is produced with all of them in
+        context -- nothing gathered along the way is hidden from it. If the
+        round budget runs out while the model is still calling tools, it is
+        explicitly asked to stop and summarize, so the final answer never
+        comes back as an empty tool-call stub."""
         bound = llm.bind_tools(tools) if tools else llm
         tool_map = {t.name: t for t in tools}
         convo = list(messages)
-        resp = None
         dt = 0.0
-        for _ in range(self.max_tool_rounds + 1):
+        for _ in range(self.max_tool_rounds):
             t0 = time.perf_counter()
             resp = bound.invoke(convo)
-            dt = time.perf_counter() - t0
+            dt += time.perf_counter() - t0
             convo.append(resp)
             if not _has_tool_calls(resp):
                 return resp, convo, dt
+            # log what the model asked its counsel, not just the answers
+            asks = "; ".join(f"{c['name']}({json.dumps(c['args'])})"
+                             for c in resp.tool_calls)
+            self.task.log("TOOL REQUEST (review)",
+                          (_text_of(resp).strip() + "\n-> " + asks).strip())
             for call in resp.tool_calls:
                 msg, _ = self._invoke_tool(tool_map, call)
                 convo.append(msg)
+        # budget exhausted while still calling tools: demand a final summary
+        # so everything learned from the tool calls makes it into the answer
+        demand = ("Tool budget exhausted. Do NOT call any more tools. Summarize "
+                  "your final answer now, incorporating everything you learned "
+                  "above.")
+        self.task.log("WARNING (review)", demand)
+        convo.append(HumanMessage(content=demand))
+        t0 = time.perf_counter()
+        resp = bound.invoke(convo)
+        dt += time.perf_counter() - t0
+        convo.append(resp)
         return resp, convo, dt
 
     # -------------------------------------------------------------------- nodes
@@ -411,9 +510,11 @@ class AgentPipeline:
                    "library). Take concise, actionable notes for the designer. "
                    "When you have enough, stop calling tools and respond with a "
                    "short notes summary.")
+        sys_content = self._sys("explore", default)
+        self._log_system("explorer", sys_content)
         bound = self.explorer_llm.bind_tools(self._explorer_toolset())
         t0 = time.perf_counter()
-        resp = bound.invoke([SystemMessage(content=self._sys("explore", default))]
+        resp = bound.invoke([SystemMessage(content=sys_content)]
                             + state["explore_messages"])
         dt = time.perf_counter() - t0
         rounds = state.get("explore_rounds", 0) + 1
@@ -438,11 +539,23 @@ class AgentPipeline:
         return out
 
     def explore_tools_node(self, state: PipelineState) -> dict:
-        """Tool executor for the explorer's channel (research calls only)."""
+        """Tool executor for the explorer's channel (research calls only).
+
+        Runs BETWEEN explorer turns, so after turn max_explore_rounds - 1 it
+        appends a wrap-up warning: the NEXT explorer turn is the last one
+        (the handoff is forced at max_explore_rounds and pending tool calls
+        would be dropped), so the explorer should spend it writing its final
+        notes instead of being cut off mid-research."""
         last = state["explore_messages"][-1]
         tool_map = {t.name: t for t in self._explorer_toolset()}
         out = [self._invoke_tool(tool_map, call, note=True)[0]
                for call in last.tool_calls]
+        if state.get("explore_rounds", 0) >= self.max_explore_rounds - 1:
+            warning = ("This is your FINAL research round. Do NOT call any "
+                       "more tools -- reply with your complete, actionable "
+                       "notes summary for the designer.")
+            self.task.log("WARNING (explorer)", warning)
+            out.append(HumanMessage(content=warning))
         return {"explore_messages": out}
 
     def generate_node(self, state: PipelineState) -> dict:
@@ -458,6 +571,7 @@ class AgentPipeline:
                 "\n\n# Research notes from the explorer\n" + notes +
                 "\n\n(Raw tool findings behind these notes: call "
                 "`check_explorer_notes`.)")
+        self._log_system("generate", sys_content)
         bound = self.generate_llm.bind_tools(self._design_tools())
         t0 = time.perf_counter()
         resp = bound.invoke([SystemMessage(content=sys_content)]
@@ -468,90 +582,180 @@ class AgentPipeline:
         out: dict = {"messages": [resp]}
         code = _extract_code(resp.content)
         if code:
+            # an explicit code block in the reply overrides the last trial's
+            # code as the submission the evaluate node will officially score
             out["current_code"] = code
         if _has_tool_calls(resp):
             out["gen_no_tool"] = 0
         else:
             out["gen_no_tool"] = state.get("gen_no_tool", 0) + 1
-            # A plain reply AFTER evaluating means "I'm satisfied" -> the router
-            # sends us to deploy, which ships best-so-far. Only nudge a model
-            # that talks without ever having evaluated anything.
-            if not state.get("last_metrics"):
-                out["messages"] = [resp, HumanMessage(content=(
-                    "You have not evaluated any candidate yet. Reply by calling "
-                    f"`{self.evaluate_tool_name}` with your candidate code "
-                    f"(up to {self.max_variants_per_turn} variants per turn, "
-                    "most promising first)."))]
+            # A plain reply after >=1 trial is a SUBMISSION -> the router sends
+            # it to the official evaluate node. Only nudge a model that talks
+            # without having run any trial (nothing to submit yet).
+            if not state.get("session_trials"):
+                nudge = ("You have not run any trial this session. Reply by "
+                         f"calling `{self.evaluate_tool_name}` with your "
+                         f"candidate code (budget: {self.max_session_trials} "
+                         "trials per session, most promising first).")
+                self.task.log("WARNING (generate)", nudge)
+                out["messages"] = [resp, HumanMessage(content=nudge)]
         return out
 
     def gen_tools_node(self, state: PipelineState) -> dict:
         """Tool executor for the design thread.
 
-        Research calls all run. Evaluate calls run SEQUENTIALLY in a for loop
-        that (a) caps at max_variants_per_turn and (b) terminates early when a
-        variant comes back invalid (error / not ok). Crucially, every skipped
-        tool_call id STILL receives a ToolMessage -- providers reject a chat
-        where a tool call has no result, so this is what keeps a multi-call
-        turn from corrupting the state.
+        Research calls all run. Trial evaluate calls run SEQUENTIALLY in a for
+        loop that (a) caps at the session budget (max_session_trials) and
+        (b) terminates early when a trial comes back invalid (error / not ok).
+        Crucially, every skipped tool_call id STILL receives a ToolMessage --
+        providers reject a chat where a tool call has no result, so this is
+        what keeps a multi-call turn from corrupting the state.
+
+        Bumps state["session_trials"] per executed trial and keeps
+        state["session_best"] / state["best_trial"] / state["current_code"]
+        pointing at the best-scoring trial (session / whole run) -- so the
+        default submission is the session's BEST design, not its latest.
         """
         last = state["messages"][-1]
         tool_map = {t.name: t for t in self._design_tools()}
+        trials = state.get("session_trials", 0)
+        n_before = trials
+        sess_best = dict(state.get("session_best") or {})
+        run_best = dict(state.get("best_trial") or {})
         out_messages = []
-        ran, failed = 0, False
+        failed = False
         for call in last.tool_calls:
             if call["name"] != self.evaluate_tool_name:
                 out_messages.append(self._invoke_tool(tool_map, call)[0])
                 continue
             if failed:
-                skip_reason = "an earlier variant in this batch failed; fix it before testing more"
-            elif ran >= self.max_variants_per_turn:
-                skip_reason = f"max {self.max_variants_per_turn} variants per turn"
+                skip_reason = ("an earlier trial in this batch failed; "
+                               "fix it before testing more")
+            elif trials >= self.max_session_trials:
+                skip_reason = (f"session budget of {self.max_session_trials} "
+                               "trials reached; reply WITHOUT tools to submit "
+                               "your design for official evaluation")
             else:
                 msg, parsed = self._invoke_tool(tool_map, call)
                 out_messages.append(msg)
-                ran += 1
-                if not (isinstance(parsed, dict) and parsed.get("ok")):
+                trials += 1
+                metrics = parsed if isinstance(parsed, dict) else {}
+                code = call["args"].get("code", "")
+                if metrics.get("ok"):
+                    score = metrics.get(self.target_metric, -1.0)
+                    # >= so equal scores go to the LATER trial
+                    if score >= sess_best.get("score", -1.0):
+                        sess_best = {"score": score, "code": code,
+                                     "trial": metrics.get("trial")}
+                    if score >= run_best.get("score", -1.0):
+                        run_best = {"score": score, "code": code,
+                                    "trial": metrics.get("trial"),
+                                    "metrics": metrics}
+                else:
                     failed = True
                 continue
             self.task.log(f"TOOL {call['name']} (skipped)", skip_reason)
             out_messages.append(ToolMessage(
                 content=json.dumps({"ok": False, "skipped": skip_reason}),
                 tool_call_id=call["id"], name=call["name"]))
-        return {"messages": out_messages}
+        # budget JUST spent: hand the last result back to the designer with an
+        # explicit ask, so it can analyze trial N before choosing what to submit
+        if n_before < self.max_session_trials <= trials:
+            ask = (f"Trial budget spent ({trials}/{self.max_session_trials}). "
+                   "Analyze all your trial results, then reply WITHOUT tool "
+                   "calls and present the design you want to submit as a "
+                   "```python block. If you don't include one, your best trial "
+                   f"(trial {sess_best.get('trial')}) is submitted.")
+            self.task.log("WARNING (generate)", ask)
+            out_messages.append(HumanMessage(content=ask))
+        # make the routing visible in the transcript
+        if trials > n_before:
+            dest = ("budget spent -> designer asked for its final design"
+                    if trials >= self.max_session_trials
+                    else "back to generate for more trials")
+            self.task.log(f"SESSION trials {trials}/{self.max_session_trials}",
+                          dest)
+        out: dict = {"messages": out_messages, "session_trials": trials,
+                     "session_best": sess_best, "best_trial": run_best,
+                     # asked to submit but evaluated again anyway -> force it
+                     "force_official": bool(
+                         n_before >= self.max_session_trials
+                         and any(c["name"] == self.evaluate_tool_name
+                                 for c in last.tool_calls))}
+        if sess_best.get("code"):
+            out["current_code"] = sess_best["code"]
+        return out
 
     def evaluate_node(self, state: PipelineState) -> dict:
-        """DETERMINISTIC record step (no LLM, no re-run).
+        """OFFICIAL evaluation -- no LLM.
 
-        The generate LLM already chose what code to execute -- its evaluate
-        tool calls carried the code, and gen_tools ran them. This node folds
-        every result of that batch into best-so-far and summarizes the batch
-        for the reviewer and the designer.
+        Re-runs the real evaluator on the submitted design (current_code: the
+        last trial's code, or the code block in the designer's final reply)
+        and records the result as the next official variant. This is the ONLY
+        place best-so-far / iteration are updated. Resets the session budget.
         """
-        evals = self._find_all_evals(state["messages"])
-        if not evals:
-            evals = [(state.get("current_code", ""),
-                      {"ok": False, "error": "no evaluation result found"})]
+        code = state.get("current_code", "")
+        variant_num = state.get("iteration", 0) + 1
+        # name the submission so designer and reviewer talk about the SAME code
+        # (the session's best trial may not be the designer's latest attempt)
+        sess_best = state.get("session_best") or {}
+        if not code:
+            submitted = "no design"
+        elif code == sess_best.get("code"):
+            submitted = f"your trial {sess_best.get('trial')}"
+        else:
+            submitted = "the code block in your final message"
+
+        def _official(c: str, tag: str) -> tuple[dict, float]:
+            t0 = time.perf_counter()
+            try:
+                kwargs = dict(self.evaluate_kwargs)
+                kwargs.setdefault("iteration", tag)
+                m = self.task.evaluate(c, **kwargs)
+            except Exception as exc:
+                m = {"ok": False, "error": f"official evaluation raised: {exc}"}
+            return m, time.perf_counter() - t0
+
+        if code:
+            metrics, dt = _official(code, f"official{variant_num}")
+        else:
+            metrics, dt = {"ok": False, "error": "no design was submitted"}, 0.0
+
+        # FALLBACK: the designer's chosen code errored -> submit the session's
+        # best trial instead (later trial wins ties), so a broken final code
+        # block can't waste the whole session
+        if (not metrics.get("ok") and sess_best.get("code")
+                and sess_best["code"] != code):
+            self.task.log(
+                f"EVALUATE variant #{variant_num}: submitted code errored -> "
+                f"falling back to session best (trial {sess_best.get('trial')})",
+                json.dumps(metrics))
+            code = sess_best["code"]
+            submitted = (f"your trial {sess_best.get('trial')} (fallback: "
+                         "the code block you submitted errored)")
+            metrics, dt = _official(code, f"official{variant_num}fallback")
+
+        score = metrics.get(self.target_metric, -1.0) if metrics.get("ok") else -1.0
         best = dict(state.get("best") or {})
-        it = state.get("iteration", 0)
-        batch_best = (-1.0, None, evals[-1][1])   # (score, code, metrics)
-        summary = []
-        for code, metrics in evals:
-            it += 1
-            score = metrics.get(self.target_metric, -1.0) if metrics.get("ok") else -1.0
-            if score > best.get(self.target_metric, -1.0):
-                best = {"code": code, self.target_metric: score, "metrics": metrics}
-            if score > batch_best[0]:
-                batch_best = (score, code, metrics)
-            summary.append(json.dumps(metrics))
-        self.task.log(f"EVALUATE (round {it}, +{len(evals)} variant(s))",
-                      "\n".join(summary))
-        out = {"last_metrics": batch_best[2], "best": best, "iteration": it,
-               "messages": [HumanMessage(content=(
-                   f"Evaluation results for this batch ({len(evals)} variant(s)):\n"
-                   + "\n".join(summary)))]}
-        if batch_best[1]:
-            out["current_code"] = batch_best[1]
-        return out
+        # >= so an equal-scoring LATER variant becomes the new best
+        if metrics.get("ok") and score >= best.get(self.target_metric, -1.0):
+            best = {"code": code, self.target_metric: score,
+                    "metrics": metrics, "variant": variant_num}
+        self.task.log(
+            f"EVALUATE official variant #{variant_num} = {submitted} "
+            f"[eval {dt:.2f}s] (best-so-far: variant #{best.get('variant', '?')})",
+            f"--- code ---\n{code}\n--- result ---\n{json.dumps(metrics)}")
+        return {"last_metrics": {**metrics, "variant": variant_num,
+                                 "submitted": submitted},
+                "best": best, "iteration": variant_num,
+                "session_trials": 0,      # fresh budget for the next session
+                "session_best": {},       # next session tracks its own best
+                "force_official": False,  # ask-then-force cycle starts over
+                "gen_no_tool": 0,         # a submission is not a refusal
+                "messages": [HumanMessage(content=(
+                    f"Official evaluation of your submitted design "
+                    f"(variant #{variant_num} = {submitted}): "
+                    f"{json.dumps(metrics)}"))]}
 
     def review_node(self, state: PipelineState) -> dict:
         """Reviewer with its OWN message thread: it remembers every candidate
@@ -559,17 +763,22 @@ class AgentPipeline:
         repeat. Only the distilled feedback string enters the design thread."""
         m = state.get("last_metrics", {})
         code = state.get("current_code", "")
-        prompt = (f"Round {state.get('iteration', 0)}. "
-                  f"Best candidate metrics this round: {json.dumps(m)}\n"
+        submitted = m.get("submitted", "the submitted design")
+        prompt = (f"Official variant #{m.get('variant', '?')} "
+                  f"({submitted}) with metrics: {json.dumps(m)}\n"
                   f"Code:\n```python\n{code}\n```\n"
                   f"Give one concrete, actionable improvement (or the fix if it "
                   f"errored). Avoid repeating advice you already gave.")
+        # the transcript must show exactly what the reviewer was given
+        # (metrics AND code), not just its answer
+        self.task.log(f"REVIEW input (variant #{m.get('variant', '?')})", prompt)
         # the seed library rides in the SYSTEM message: the reviewer sees it on
         # every call, but it is never appended to the accumulating review
         # thread, so it is not duplicated round after round.
         review_system = (self.task.system_prompt("review")
                          + "\n\n# Seed library (known-good reference designs)\n"
                          + self._seed_block())
+        self._log_system("review", review_system)
         resp, _, dt = self._run_with_tools(
             self.review_llm, self.review_tools,
             [SystemMessage(content=review_system)]
@@ -583,20 +792,54 @@ class AgentPipeline:
                 # (a fresh AIMessage, so no dangling tool-call pairs persist)
                 "review_messages": [HumanMessage(content=prompt),
                                     AIMessage(content=note)],
-                "messages": [HumanMessage(content=f"Reviewer feedback: {note}")]}
+                "messages": [HumanMessage(content=(
+                    f"Reviewer feedback on variant "
+                    f"#{m.get('variant', '?')} ({submitted}) -- NOT necessarily "
+                    f"your latest attempt:\n{note}"))]}
 
     def deploy_node(self, state: PipelineState) -> dict:
-        best = state.get("best") or {}
+        best = dict(state.get("best") or {})
+        iteration = state.get("iteration", 0)
+
+        # SALVAGE: if the best trial of the run still beats the best official
+        # variant (e.g. the designer submitted a different design), officially
+        # evaluate it now so the best circuit ever tested is never lost.
+        bt = state.get("best_trial") or {}
+        if bt.get("code") and bt.get("score", -1.0) > best.get(self.target_metric, -1.0):
+            iteration += 1
+            t0 = time.perf_counter()
+            try:
+                kwargs = dict(self.evaluate_kwargs)
+                kwargs.setdefault("iteration", f"official{iteration}salvage")
+                metrics = self.task.evaluate(bt["code"], **kwargs)
+            except Exception as exc:
+                metrics = {"ok": False,
+                           "error": f"official evaluation raised: {exc}"}
+            score = (metrics.get(self.target_metric, -1.0)
+                     if metrics.get("ok") else -1.0)
+            self.task.log(
+                f"EVALUATE official variant #{iteration} "
+                f"[eval {time.perf_counter() - t0:.2f}s] "
+                f"(SALVAGED best trial {bt.get('trial')}, never submitted)",
+                f"--- code ---\n{bt['code']}\n--- result ---\n{json.dumps(metrics)}")
+            if score > best.get(self.target_metric, -1.0):
+                best = {"code": bt["code"], self.target_metric: score,
+                        "metrics": metrics, "variant": iteration}
+
         extra = (f"\nAdditional user instructions for deployment:\n{self.deploy_prompt}"
                  if self.deploy_prompt else "")
+        deploy_system = self.task.system_prompt("deploy")
+        self._log_system("deploy", deploy_system)
         t0 = time.perf_counter()
         summary_resp = self.deploy_llm.invoke([
-            SystemMessage(content=self.task.system_prompt("deploy")),
+            SystemMessage(content=deploy_system),
             HumanMessage(content=(
-                f"The search finished after {state.get('iteration', 0)} variants. "
-                f"Best artifact and stats:\n{json.dumps(best, indent=2)}\n"
-                f"Summarize what was designed, the final stats, and the rationale."
-                f"{extra}")),
+                f"The search finished after {iteration} official "
+                f"variant(s) ({self._eval_count} trial evaluations in total). "
+                f"The best artifact was variant #{best.get('variant', '?')}; "
+                f"its code and stats:\n{json.dumps(best, indent=2)}\n"
+                f"Summarize what was designed (mention which variant won), the "
+                f"final stats, and the rationale.{extra}")),
         ])
         summary = _text_of(summary_resp)
         self.task.log(f"DEPLOY summary [llm {time.perf_counter() - t0:.2f}s]", summary)
@@ -614,6 +857,7 @@ class AgentPipeline:
 
         return {"messages": [summary_resp],
                 "review": summary,
+                "best": best, "iteration": iteration,   # includes any salvage
                 "last_metrics": {**state.get("last_metrics", {}),
                                  "summary": summary, "translated": translated}}
 
@@ -633,20 +877,20 @@ class AgentPipeline:
 
     def _route_after_generate(self, state: PipelineState) -> str:
         if _has_tool_calls(state["messages"][-1]):
-            return "gen_tools"      # research or evaluate call(s) -> executor
-        if state.get("last_metrics"):
-            return "deploy"         # plain reply after evaluating -> ship best-so-far
+            return "gen_tools"      # research or trial call(s) -> executor
+        if state.get("session_trials", 0) > 0:
+            return "evaluate"       # plain reply after >=1 trial = submission
         if state.get("gen_no_tool", 0) >= self.max_gen_no_tool:
-            return "deploy"         # never evaluated and won't -> wrap up
+            return "deploy"         # refuses to run any trial -> give up
         return "generate"           # nudged; let it try again
 
     def _route_after_gen_tools(self, state: PipelineState) -> str:
-        for msg in reversed(state["messages"]):
-            if _has_tool_calls(msg):
-                if any(c["name"] == self.evaluate_tool_name for c in msg.tool_calls):
-                    return "evaluate"   # evaluated variants -> record them
-                break
-        return "generate"          # pure research batch -> back to the designer
+        # ALL trial results return to generate -- including the last one, so it
+        # can analyze it and choose its submission. Official evaluation is only
+        # forced on a designer that keeps calling evaluate after being asked.
+        if state.get("force_official"):
+            return "evaluate"
+        return "generate"
 
     def _route_after_evaluate(self, state: PipelineState) -> str:
         return "deploy" if self._done(state) else "review"
@@ -677,7 +921,7 @@ class AgentPipeline:
             g.add_edge(START, "generate")            # explorer toggled off
 
         g.add_conditional_edges("generate", self._route_after_generate,
-                                {"gen_tools": "gen_tools",
+                                {"gen_tools": "gen_tools", "evaluate": "evaluate",
                                  "generate": "generate", "deploy": "deploy"})
         g.add_conditional_edges("gen_tools", self._route_after_gen_tools,
                                 {"evaluate": "evaluate", "generate": "generate"})
@@ -688,20 +932,68 @@ class AgentPipeline:
         g.add_edge("deploy", END)
         return g.compile()
 
+    def _dump_histories(self, final: dict) -> dict:
+        """Write each message channel to its own readable .txt in the run
+        folder. System prompts are not stored in the channels (they are
+        rebuilt per call), so each file starts with the LAST system prompt
+        used by that channel's agent."""
+        channels = {
+            "design": ("generate", final.get("messages") or []),
+            "explorer": ("explorer", final.get("explore_messages") or []),
+            "review": ("review", final.get("review_messages") or []),
+        }
+        paths = {}
+        for name, (role, msgs) in channels.items():
+            if not msgs:
+                continue
+            path = os.path.join(self.task.run_dir, f"history_{name}.txt")
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    system = self._logged_systems.get(role)
+                    if system:
+                        f.write(f"{'=' * 72}\n[system prompt -- final version; "
+                                f"earlier versions in transcript.txt]\n"
+                                f"{'=' * 72}\n{system}\n")
+                    for i, m in enumerate(msgs, 1):
+                        role_name = type(m).__name__.replace("Message", "")
+                        tool_name = getattr(m, "name", None)
+                        header = f"[{i}] {role_name}" + (
+                            f" ({tool_name})" if tool_name else "")
+                        f.write(f"\n{'=' * 72}\n{header}\n{'=' * 72}\n")
+                        text = _text_of(m).strip()
+                        if text:
+                            f.write(text + "\n")
+                        for call in (getattr(m, "tool_calls", None) or []):
+                            f.write(f"\n[tool_call] {call['name']}\n")
+                            for k, v in (call.get("args") or {}).items():
+                                f.write(f"{k}:\n{v}\n")
+                paths[name] = path
+            except Exception as exc:
+                logger_msg = f"failed to write {path}: {exc}"
+                self.task.log("HISTORY DUMP ERROR", logger_msg)
+        if paths:
+            self.task.log("MESSAGE HISTORIES",
+                          "\n".join(f"{k}: {v}" for k, v in paths.items()))
+        return paths
+
     # --------------------------------------------------------------- run
     def run(self, extra_instructions: str = "") -> dict:
         design_first = HumanMessage(content=(
             "Design and iteratively improve the artifact. Start by calling "
             "`view_seed_library` to see known-good reference designs you may "
             f"adapt or combine. {extra_instructions}\n"
-            f"Call the `{self.evaluate_tool_name}` tool on each candidate to "
-            f"score it -- up to {self.max_variants_per_turn} variants per turn, "
-            "most promising first (if one errors, the rest of the turn is "
-            "skipped). When you are satisfied, reply WITHOUT calling any tool "
-            "and the best candidate so far will be deployed."))
+            f"Test candidates with the `{self.evaluate_tool_name}` tool -- you "
+            f"have a budget of {self.max_session_trials} trials per design "
+            "session, and each result comes back to you so you can iterate. "
+            "When you are happy with a design, reply WITHOUT calling any tool "
+            "and include your chosen design in a ```python block (otherwise "
+            "your session's best trial is used); it will then be officially "
+            "evaluated and reviewed."))
 
         init_state: dict = {"messages": [design_first], "review_messages": [],
                             "notes": "", "iteration": 0, "best": {},
+                            "session_trials": 0, "session_best": {},
+                            "best_trial": {}, "force_official": False,
                             "gen_no_tool": 0}
         if self.use_explorer:
             init_state["explore_messages"] = [HumanMessage(content=(
@@ -715,20 +1007,24 @@ class AgentPipeline:
                       f"explorer_tools={[t.name for t in self._explorer_toolset()]}\n"
                       f"design_tools={[t.name for t in self._design_tools()]} "
                       f"review_tools={[t.name for t in self.review_tools]}\n"
-                      f"max_iters={self.max_iters} "
+                      f"max_iters={self.max_iters} (official variants) "
                       f"target={self.target_metric}>={self.target_value} "
-                      f"max_variants_per_turn={self.max_variants_per_turn} "
+                      f"max_session_trials={self.max_session_trials} "
                       f"entry_point={self.entry_point}")
         run_t0 = time.perf_counter()
         app = self.build_graph()
         final = app.invoke(init_state, {"recursion_limit": 100})
         self.task.log("TOTAL RUNTIME",
                       f"{time.perf_counter() - run_t0:.2f}s over "
-                      f"{final.get('iteration', 0)} variants")
-        return {"best": final.get("best", {}),
+                      f"{final.get('iteration', 0)} official variant(s) / "
+                      f"{self._eval_count} trial(s)")
+        history_paths = self._dump_histories(final)
+        return {"history_paths": history_paths,
+                "best": final.get("best", {}),
                 "summary": final.get("review", ""),
                 "notes": final.get("notes", ""),
                 "translated": final.get("last_metrics", {}).get("translated"),
                 "iterations": final.get("iteration", 0),
+                "trials": self._eval_count,
                 "log_path": self.task.log_path,
                 "notes_path": self.notes_path}

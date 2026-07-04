@@ -45,7 +45,7 @@ REPEATS       = int(os.environ.get("REPEATS", 2))
 RANDOM_STATE  = int(os.environ.get("RANDOM_STATE", 0))
 FEATURE_MAP   = os.environ.get("FEATURE_MAP", "karimi").strip().lower()  # zz|zdiag|rxryrz|pauli|karimi
 LAYERS        = int(os.environ.get("DQC1_LAYERS", 2))
-DATA_NOISE    = float(os.environ.get("DATA_NOISE", 0.5))
+DATA_NOISE    = float(os.environ.get("DATA_NOISE", 0))
 print(f"[CONFIG] DATA_NOISE = {DATA_NOISE}")
 
 
