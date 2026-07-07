@@ -15,8 +15,8 @@ DQC1_COMP_RANK, DQC1_EXACT_*, RANDOM_STATE, ...). New knobs:
 
     CLUSTER_DATASETS  which paper datasets to score on, "+"-separated
                       (default "spirals"; e.g. "spirals+moons+circles")
-    CLUSTER_N_POINTS  points per dataset (default 60 -- the DQC1 kernel is
-                      O(N^2) statevector simulations, keep this small)
+    CLUSTER_N_POINTS  points per dataset (default 100 -- the DQC1 kernel is
+                      O(N^2) statevector simulations, keep this modest)
     CLUSTER_VARIANT   "full" (default) = init + DeltaH + reduction + K*
                       "pre"            = init + DeltaH assignment only
 
@@ -33,6 +33,18 @@ from __future__ import annotations
 import os
 import sys
 import datetime
+
+# Honor .env even when THIS module is the entry point (e.g.
+# `python clustering_task.py baselines`) -- otherwise only run_discovery_
+# clustering.py loads it and a direct run silently uses defaults. Must run
+# before `import dqc1` and the CLUSTER_*/DQC1_* reads below, since those read
+# os.environ at import. load_dotenv does NOT override already-set vars, so it
+# is a harmless no-op when run_discovery already called it.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # dqc1.py prints non-ASCII (Δ, …) in its timers; Windows consoles default to
 # cp1252, which would turn every evaluation into a UnicodeEncodeError.
@@ -53,8 +65,11 @@ from eval_harness import compile_feature_map
 from DiscoveryTask import DiscoveryTask
 
 CLUSTER_DATASETS = os.environ.get("CLUSTER_DATASETS", "spirals")
-CLUSTER_N_POINTS = int(os.environ.get("CLUSTER_N_POINTS", 60))
+CLUSTER_N_POINTS = int(os.environ.get("CLUSTER_N_POINTS", 100))
 CLUSTER_VARIANT = os.environ.get("CLUSTER_VARIANT", "full").strip().lower()
+# 1 -> the generate/review prompts also push for fewer qubits/gates/lower
+# depth as a SECONDARY objective (ARI always stays primary)
+CLUSTER_MINIMIZE_RESOURCES = os.environ.get("CLUSTER_MINIMIZE_RESOURCES", "0") != "0"
 
 # The DQC1 kernel circuit holds 2n+1 qubits (probe + system + purification),
 # so cap the feature-map width to keep each kernel entry cheap to simulate.
@@ -92,10 +107,59 @@ def _kmeans_ari(name: str, X: np.ndarray, y: np.ndarray) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Config snapshot: a config.txt written into every folder that receives plots,
+# recording every knob that affects a clustering result -- so any figure can be
+# reproduced from the file sitting next to it. dqc1 values are read LIVE (they
+# may be overridden at runtime), not from import-time copies.
+# ---------------------------------------------------------------------------
+def pipeline_config(**extra) -> dict:
+    """Every setting that changes a clustering result, as an ordered dict."""
+    cfg = {
+        # this module's knobs
+        "CLUSTER_DATASETS": CLUSTER_DATASETS,
+        "CLUSTER_N_POINTS": CLUSTER_N_POINTS,
+        "CLUSTER_VARIANT": CLUSTER_VARIANT,
+        "CLUSTER_MINIMIZE_RESOURCES": CLUSTER_MINIMIZE_RESOURCES,
+        "MAX_QUBITS": MAX_QUBITS,
+        # dqc1.py knobs that drive the kernel / entropy / clustering
+        "DATA_NOISE": dqc1.DATA_NOISE,
+        "RANDOM_STATE": dqc1.RANDOM_STATE,
+        "INIT_CLUSTERS": dqc1.INIT_CLUSTERS,
+        "MIN_CLUSTERS": dqc1.MIN_CLUSTERS,
+        "N_INIT": dqc1.N_INIT,
+        "REPEATS": dqc1.REPEATS,
+        "DQC1_COMP_RANK": dqc1.DQC1_COMP_RANK,
+        "DQC1_EXACT_KERNEL": dqc1.DQC1_EXACT_KERNEL,
+        "DQC1_EXACT_PURITY": dqc1.DQC1_EXACT_PURITY,
+        "DQC1_KERNEL_SHOTS": dqc1.DQC1_KERNEL_SHOTS,
+        "DQC1_PURITY_SHOTS": dqc1.DQC1_PURITY_SHOTS,
+        "PARZEN_SIGMA_GRID": dqc1.PARZEN_SIGMA_GRID,
+    }
+    cfg.update(extra)                      # caller extras (e.g. which map)
+    return cfg
+
+
+def write_plot_config(plot_dir: str, **extra) -> str:
+    """Write/refresh config.txt in plot_dir, snapshotting the settings behind
+    the figures there. Note: the candidate/seed feature map is supplied as
+    build_circuit code, so dqc1's FEATURE_MAP/LAYERS do NOT apply here."""
+    os.makedirs(plot_dir, exist_ok=True)
+    path = os.path.join(plot_dir, "config.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"# clustering config -- {datetime.datetime.now():%Y-%m-%d %H:%M:%S}\n")
+        f.write("# feature map is candidate/seed build_circuit code; "
+                "dqc1 FEATURE_MAP/LAYERS are not used\n")
+        for k, v in pipeline_config(**extra).items():
+            f.write(f"{k} = {v}\n")
+    return path
+
+
+# ---------------------------------------------------------------------------
 # Plotting (dqc1.py panel style): one scatter per dataset, colored by labels
 # ---------------------------------------------------------------------------
 def _save_cluster_plot(results: dict, iteration=None, plot_dir: str = "plots"):
     os.makedirs(plot_dir, exist_ok=True)
+    write_plot_config(plot_dir)
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     tag = f"_iter{iteration}" if iteration is not None else ""
     path = os.path.join(plot_dir, f"clustering_{stamp}{tag}.png")
@@ -321,10 +385,256 @@ def build_circuit(x):
 
 
 # ---------------------------------------------------------------------------
+# Measured seed baselines: shown to the agent (in the seed library AND the
+# generate system prompt) as "the numbers to beat".
+#
+# Two ways to refresh when CLUSTER_* / dqc1 knobs change:
+#   manual : run  python clustering_task.py baselines  and paste the printed
+#            dict over SEED_BASELINE_STATS below, or
+#   dynamic: pass make_clustering_task(seed_stats=compute_seed_baselines(...))
+# Values below measured at N=100 (seed_baselines/20260706_171309). NOTE: the
+# DQC1-full pipeline is strongly N-sensitive with a FIXED DQC1_COMP_RANK -- at
+# N=100 the rank-8 cluster compression blurs the entropy estimate, so scores
+# collapse vs N=60 (rxryrz 0.634->0.060) and the ranking inverts (karimi/iqp
+# lead at 0.186). If DQC1_COMP_RANK or N changes, refresh these.
+# ---------------------------------------------------------------------------
+SEED_BASELINE_CONFIG = "spirals, DQC1-full, N=80, DATA_NOISE=0.0, RANDOM_STATE=0"
+SEED_BASELINE_STATS = {
+    "karimi_single_layer_pauli_z": {"ari": 0.2168, "nmi": 0.204, "gates": 5, "depth": 3},
+    "zz_multi_layer": {"ari": 0.0394, "nmi": 0.0411, "gates": 8, "depth": 5},
+    "zdiag_ising": {"ari": -0.0036, "nmi": 0.0063, "gates": 6, "depth": 4},
+    "rxryrz_reuploading": {"ari": 0.0398, "nmi": 0.0431, "gates": 14, "depth": 8},
+    "pauli_higher_order": {"ari": -0.0011, "nmi": 0.0086, "gates": 6, "depth": 4},
+    "pauli_xz": {"ari": 0.1519, "nmi": 0.1896, "gates": 9, "depth": 6},
+    "iqp": {"ari": 0.2168, "nmi": 0.204, "gates": 5, "depth": 3},
+    "hamiltonian_trotter": {"ari": 0.1519, "nmi": 0.1896, "gates": 5, "depth": 3},
+    "random_kitchen_sinks": {"ari": -0.0098, "nmi": 0.0006, "gates": 7, "depth": 4},
+}
+
+
+def _annotated_seeds(seed_stats: dict | None) -> dict:
+    """The seed library with each map's measured baseline prepended as a
+    comment, so `view_seed_library` shows code AND score together."""
+    if not seed_stats:
+        return dict(SEED_CLUSTER_FEATURE_MAPS)
+    out = {}
+    for name, code in SEED_CLUSTER_FEATURE_MAPS.items():
+        s = seed_stats.get(name)
+        if isinstance(s, dict) and "ari" in s:
+            header = (f"# measured ({SEED_BASELINE_CONFIG}): "
+                      f"mean ARI={s['ari']:.3f}, NMI={s['nmi']:.3f}, "
+                      f"gates={s['gates']}, depth={s['depth']}")
+        else:
+            header = "# (no measured baseline yet)"
+        out[name] = f"\n{header}\n{code.strip()}\n"
+    return out
+
+
+def save_seed_comparison_chart(stats: dict, path: str, note: str = "") -> str:
+    """Horizontal grouped bars of mean ARI/NMI per feature map, sorted by ARI
+    (best on top); rows whose name starts with '>>' (the agent) are bolded.
+    `stats` maps name -> {"ari", "nmi", ...}; error entries are skipped."""
+    rows = [(n, s) for n, s in stats.items()
+            if isinstance(s, dict) and "ari" in s]
+    if not rows:
+        return ""
+    write_plot_config(os.path.dirname(path) or ".", chart_note=note)
+    rows.sort(key=lambda kv: kv[1]["ari"])            # barh: last row on top
+    names = [n for n, _ in rows]
+    y = np.arange(len(rows))
+    h = 0.38
+    fig, ax = plt.subplots(figsize=(9, 0.55 * len(rows) + 2))
+    b_ari = ax.barh(y + h / 2, [s["ari"] for _, s in rows], height=h,
+                    color="#2563eb", label="mean ARI")
+    b_nmi = ax.barh(y - h / 2, [s["nmi"] for _, s in rows], height=h,
+                    color="#d97706", label="mean NMI")
+    ax.bar_label(b_ari, fmt="%.3f", padding=3, fontsize=8)
+    ax.bar_label(b_nmi, fmt="%.3f", padding=3, fontsize=8)
+    ax.set_yticks(y, names, fontsize=9)
+    for tick, name in zip(ax.get_yticklabels(), names):
+        if name.startswith(">>"):
+            tick.set_fontweight("bold")
+    ax.axvline(0, color="0.5", lw=0.8)
+    ax.set_xlabel("score")
+    ax.set_title("Feature-map comparison" + (f" — {note}" if note else ""),
+                 fontsize=11)
+    ax.grid(True, axis="x", alpha=0.3)
+    ax.legend(loc="lower right", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
+
+
+def new_baseline_run_dir(root: str = "seed_baselines") -> str:
+    """Create and return seed_baselines/<timestamp>/ -- one folder per script
+    run, so each invocation's figures stay together instead of piling up (and
+    overwriting each other's seed_comparison.png) in the shared root."""
+    path = os.path.join(root, datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def compute_seed_baselines(datasets: str = CLUSTER_DATASETS,
+                           n_points: int = CLUSTER_N_POINTS,
+                           variant: str = CLUSTER_VARIANT,
+                           plot_dir: str | None = "seed_baselines") -> dict:
+    """Score every seed feature map with the real evaluator (~1 min each) and
+    return {name: {"ari", "nmi", "gates", "depth"}}.
+
+    Also prints the dict as paste-ready Python for SEED_BASELINE_STATS, and
+    (with plot_dir) saves one clustering figure per seed plus the comparison
+    bar chart. Use whenever the datasets / pipeline knobs change.
+    """
+    data = load_cluster_datasets(datasets, n_points)
+    config = (f"{datasets}, DQC1-{variant}, N={n_points}, "
+              f"DATA_NOISE={dqc1.DATA_NOISE}, RANDOM_STATE={dqc1.RANDOM_STATE}")
+    stats: dict = {}
+    for name, code in SEED_CLUSTER_FEATURE_MAPS.items():
+        m = evaluate_clustering(code, datasets=data, variant=variant,
+                                plot=bool(plot_dir), iteration=f"seed_{name}",
+                                plot_dir=plot_dir or "plots")
+        if m.get("ok"):
+            stats[name] = {"ari": round(m["ari"], 4), "nmi": round(m["nmi"], 4),
+                           "gates": m["n_gates"], "depth": m["depth"]}
+            print(f"  {name:34s} ari={m['ari']:.4f} nmi={m['nmi']:.4f} "
+                  f"gates={m['n_gates']} depth={m['depth']}")
+        else:
+            stats[name] = {"error": m.get("error")}
+            print(f"  {name:34s} ERROR: {m.get('error')}")
+    if plot_dir:
+        chart = save_seed_comparison_chart(
+            stats, os.path.join(plot_dir, "seed_comparison.png"), note=config)
+        print(f"  [chart] {chart}")
+    print("\n# paste over SEED_BASELINE_STATS in clustering_task.py:")
+    print(f'SEED_BASELINE_CONFIG = "{config}"')
+    print("SEED_BASELINE_STATS = {")
+    for n, s in stats.items():
+        if "ari" in s:
+            print(f'    "{n}": {{"ari": {s["ari"]}, "nmi": {s["nmi"]}, '
+                  f'"gates": {s["gates"]}, "depth": {s["depth"]}}},')
+    print("}")
+    return stats
+
+
+def classical_baselines(datasets: dict | None = None,
+                        plot_dir: str | None = None) -> dict:
+    """Score dqc1.py's classical methods on the same datasets: Parzen FULL
+    (Gaussian Renyi-2 via dqc1.parzen_full_labels, sigma grid + reduction +
+    K*) and k-means (K = #ground-truth classes). With plot_dir, saves a
+    dqc1.run_synthetic_and_save-style panel figure (one row per dataset,
+    Parzen | K-Means). Returns {dataset: {"parzen_full": ..., "kmeans": ...}}.
+    """
+    if datasets is None:
+        datasets = load_cluster_datasets()
+    out: dict = {}
+    panels: dict = {}
+    for name, (X, y) in datasets.items():
+        Xn = zero_mean_to_unit_interval(X)
+        p_labels, p_kstar, p_sigma = dqc1.parzen_full_labels(
+            X, sigma_grid=dqc1.PARZEN_SIGMA_GRID, repeats=dqc1.REPEATS)
+        p = eval_scores(Xn, y, p_labels)
+        km_labels = KMeans(n_clusters=len(np.unique(y)), n_init=20,
+                           random_state=dqc1.RANDOM_STATE).fit_predict(Xn)
+        k = eval_scores(Xn, y, km_labels)
+        out[name] = {
+            "parzen_full": {"ARI": round(p["ARI"], 4), "NMI": round(p["NMI"], 4),
+                            "Kstar": int(p_kstar), "sigma": float(p_sigma)},
+            "kmeans": {"ARI": round(k["ARI"], 4), "NMI": round(k["NMI"], 4),
+                       "K": int(k["K"])},
+        }
+        panels[name] = (X, p_labels, km_labels)
+    if plot_dir:
+        os.makedirs(plot_dir, exist_ok=True)
+        write_plot_config(plot_dir, methods="Parzen FULL (Gaussian) + k-means")
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(plot_dir, f"classical_baselines_{stamp}.png")
+        fig, axes = plt.subplots(len(panels), 2,
+                                 figsize=(10, 4.5 * len(panels)), squeeze=False)
+        for row, (name, (X, p_labels, km_labels)) in enumerate(panels.items()):
+            r = out[name]
+            ax1, ax2 = axes[row]
+            ax1.scatter(X[:, 0], X[:, 1], c=p_labels, s=12, cmap="tab10")
+            ax1.set_title(f"Parzen FULL (Gauss) — {name} "
+                          f"(K*={r['parzen_full']['Kstar']}, "
+                          f"σ={r['parzen_full']['sigma']:.2f}, "
+                          f"ARI={r['parzen_full']['ARI']:.3f})", fontsize=10)
+            ax2.scatter(X[:, 0], X[:, 1], c=km_labels, s=12, cmap="tab10")
+            ax2.set_title(f"K-Means — {name} (K={r['kmeans']['K']}, "
+                          f"ARI={r['kmeans']['ARI']:.3f})", fontsize=10)
+            for ax in (ax1, ax2):
+                ax.grid(True, alpha=.3)
+        fig.tight_layout()
+        fig.savefig(path, dpi=120)
+        plt.close(fig)
+        out["plot_path"] = path
+    return out
+
+
+def format_classical_report(res: dict) -> str:
+    """classical_baselines() output as a printable table (one row/dataset)."""
+    lines = []
+    for name, r in res.items():
+        if name == "plot_path":
+            continue
+        p, k = r["parzen_full"], r["kmeans"]
+        lines.append(
+            f"  {name:16s} Parzen-FULL: ARI={p['ARI']:.3f} NMI={p['NMI']:.3f} "
+            f"(K*={p['Kstar']}, sigma={p['sigma']:.2f}) | "
+            f"k-means: ARI={k['ARI']:.3f} NMI={k['NMI']:.3f} (K={k['K']})")
+    if res.get("plot_path"):
+        lines.append(f"  [plot] {res['plot_path']}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Prompts, one per agent role
 # ---------------------------------------------------------------------------
-def _system_prompts(dataset_names: list[str], variant: str) -> dict[str, str]:
+def _system_prompts(dataset_names: list[str], variant: str,
+                    seed_stats: dict | None = None,
+                    minimize_resources: bool = False) -> dict[str, str]:
     sets = ", ".join(dataset_names)
+    # optional secondary objective: circuit economy (toggle, off by default)
+    resource_block, resource_note = "", ""
+    if minimize_resources:
+        resource_block = (
+            "\n\n# Secondary objective: circuit economy\n"
+            "Among candidates with comparable mean ARI, PREFER fewer qubits, "
+            "fewer gates, and lower depth (all three are reported in every "
+            "evaluation result). Never trade ARI away for economy: beat the "
+            "baseline first, then simplify -- drop gates that do not change "
+            "the score, use the fewest qubits that work, and prefer shallow "
+            "layers over stacked ones.")
+        resource_note = (" Also flag waste: qubits, gates, or depth that do "
+                         "not earn their ARI.")
+    # "numbers to beat", built from the measured seed baselines (if provided)
+    rows = [(n, s) for n, s in (seed_stats or {}).items()
+            if isinstance(s, dict) and "ari" in s]
+    beat_note, baseline_block = "", ""
+    if rows:
+        best_name, best_s = max(rows, key=lambda kv: kv[1]["ari"])
+        table = "\n".join(f"  - {n}: mean ARI={s['ari']:.3f}, "
+                          f"NMI={s['nmi']:.3f}, gates={s['gates']}, "
+                          f"depth={s['depth']}" for n, s in rows)
+        beat_note = (f" The measured best seed is {best_name} at mean ARI "
+                     f"{best_s['ari']:.3f}; the goal is to EXCEED it.")
+        baseline_block = (
+            f"\n\n# Measured seed baselines ({SEED_BASELINE_CONFIG})\n"
+            f"Every seed in the library has already been scored by this exact "
+            f"evaluator:\n{table}\n"
+            f"THE NUMBER TO BEAT: {best_name}, mean ARI {best_s['ari']:.3f}. "
+            f"A candidate only counts as a success if its mean ARI EXCEEDS "
+            f"that. Before designing, reason about WHY the strong seeds win and "
+            f"the weak ones fail, then extend, hybridize, or rethink them.\n"
+            f"HARD RULE ON YOUR SUBMISSION: the circuit you finally submit MUST "
+            f"be your own design -- never a seed copied verbatim, and never a "
+            f"seed with only comments, names, or whitespace changed. This holds "
+            f"EVEN IF none of your trials beat {best_name}: in that case submit "
+            f"the best ORIGINAL circuit you built and state plainly that it did "
+            f"not beat the seed. Falling back to a seed as your answer is an "
+            f"automatic failure -- the seeds are already known, so re-reporting "
+            f"one teaches nothing. Your job is to produce a NEW circuit and an "
+            f"honest measurement of it.")
     return {
         "explore": (
             f"You are a research assistant for designing quantum feature maps for "
@@ -337,6 +647,7 @@ def _system_prompts(dataset_names: list[str], variant: str) -> dict[str, str]:
             f"the trace kernel separate curved manifolds (polynomial Pauli-Z phases, "
             f"data re-uploading, radial/angular encodings). Take concise, actionable "
             f"notes for the designer, then stop calling tools and summarize."
+            + beat_note
         ),
         "generate": (
             f"You are an expert quantum circuit designer. Design the quantum feature "
@@ -349,6 +660,20 @@ def _system_prompts(dataset_names: list[str], variant: str) -> dict[str, str]:
             f"global structure comes from how phases depend on x. Diagonal-only "
             f"maps give K = product of cosines of phase differences; non-diagonal "
             f"rotations (RX/RY) change this qualitatively.\n"
+            f"Search strategy (IMPORTANT):\n"
+            f"- LOCAL SEARCH FIRST. Your first trial each session should be the "
+            f"current best design -- start from the strongest seed -- with ONE "
+            f"targeted change (e.g. a bandwidth scalar on the angles, one extra "
+            f"layer, one feature swapped). Establish that baseline BEFORE any "
+            f"larger redesign; do not blue-sky a brand-new architecture until a "
+            f"minimal edit of the best seed has been scored.\n"
+            f"- SMALL BEATS BIG. The DQC1 trace kernel |tr(U U'^dag)|/2^n "
+            f"CONCENTRATES toward zero as the circuit grows -- more qubits, "
+            f"gates, and depth tend to flatten the kernel (all entries converge) "
+            f"and destroy the discriminability that separates clusters. Prefer "
+            f"2-3 qubits and at most ~2 layers. When a bigger circuit scores "
+            f"WORSE, that is kernel concentration, not too little expressivity: "
+            f"shrink, do not grow.\n"
             f"Contract for the code you return:\n"
             f"- Define exactly one function build_circuit(x) -> QuantumCircuit.\n"
             f"- x is a length-2 numpy array with entries normalized to about "
@@ -362,6 +687,7 @@ def _system_prompts(dataset_names: list[str], variant: str) -> dict[str, str]:
             f"variants deliberately). Metrics include per-dataset ARI/NMI and a "
             f"k-means reference ARI. After you see the scores, refine and "
             f"evaluate again, or reply WITHOUT a tool call when you are satisfied."
+            + baseline_block + resource_block
         ),
         "review": (
             "You are a critical reviewer of quantum feature maps for DQC1 "
@@ -371,6 +697,7 @@ def _system_prompts(dataset_names: list[str], variant: str) -> dict[str, str]:
             "kernel), higher-order polynomial Z terms, non-diagonal rotations, "
             "radial/angular encodings for rings, or fewer layers if the kernel "
             "is concentrating. Two sentences max. If it errored, state the fix."
+            + beat_note + resource_note
         ),
         "deploy": (
             "You are writing the final report for an automated search over quantum "
@@ -383,7 +710,18 @@ def _system_prompts(dataset_names: list[str], variant: str) -> dict[str, str]:
 
 def make_clustering_task(datasets: str = CLUSTER_DATASETS,
                          n_points: int = CLUSTER_N_POINTS,
-                         variant: str = CLUSTER_VARIANT) -> DiscoveryTask:
+                         variant: str = CLUSTER_VARIANT,
+                         seed_stats: dict | None = None,
+                         minimize_resources: bool = CLUSTER_MINIMIZE_RESOURCES,
+                         ) -> DiscoveryTask:
+    """seed_stats: measured per-seed baselines shown to the agent as the
+    numbers to beat. Default: the hardcoded SEED_BASELINE_STATS (measured
+    under SEED_BASELINE_CONFIG -- refresh if the config changed); pass
+    compute_seed_baselines(...) output for fresh values, or {} to disable.
+    minimize_resources: adds the optional circuit-economy section to the
+    generate/review prompts (env toggle: CLUSTER_MINIMIZE_RESOURCES=1)."""
+    if seed_stats is None:
+        seed_stats = SEED_BASELINE_STATS
     data = load_cluster_datasets(datasets, n_points)
 
     def _evaluate(code: str, *args, **kwargs) -> dict:
@@ -396,8 +734,9 @@ def make_clustering_task(datasets: str = CLUSTER_DATASETS,
 
     task = DiscoveryTask(
         name=f"dqc1_clustering_{'_'.join(data)}_{variant}",
-        system_prompts=_system_prompts(list(data), variant),
-        seeds={"cluster_feature_map": SEED_CLUSTER_FEATURE_MAPS},
+        system_prompts=_system_prompts(list(data), variant, seed_stats,
+                                       minimize_resources),
+        seeds={"cluster_feature_map": _annotated_seeds(seed_stats)},
         evaluate_fn=_evaluate,
         knowledge_sources=[
             "Salehi et al., Unsupervised QML using One Clean Qubit (SPIE)",
@@ -410,7 +749,23 @@ def make_clustering_task(datasets: str = CLUSTER_DATASETS,
 
 
 if __name__ == "__main__":
-    task = make_clustering_task()
-    print(task.describe())
-    seed = SEED_CLUSTER_FEATURE_MAPS["karimi_single_layer_pauli_z"]
-    print("baseline eval:", task.evaluate(seed, plot=True))
+    if len(sys.argv) > 1 and sys.argv[1] == "baselines":
+        # refresh the seed baselines (~1 min per seed at the default 60
+        # points): per-seed clustering figures + comparison chart + paste-
+        # ready stats dict, THEN the classical methods (Parzen FULL Gaussian
+        # + k-means) with their own clustering panels -- everything lands in
+        # ONE timestamped seed_baselines/<stamp>/ folder so quantum and
+        # classical plots for this run sit side by side
+        run_dir = new_baseline_run_dir()
+        compute_seed_baselines(plot_dir=run_dir)
+        print("\nClassical baselines (same datasets):")
+        print(format_classical_report(classical_baselines(plot_dir=run_dir)))
+    elif len(sys.argv) > 1 and sys.argv[1] == "classical":
+        # classical methods only (fast: no quantum circuits involved)
+        print(format_classical_report(
+            classical_baselines(plot_dir=new_baseline_run_dir())))
+    else:
+        task = make_clustering_task()
+        print(task.describe())
+        seed = SEED_CLUSTER_FEATURE_MAPS["karimi_single_layer_pauli_z"]
+        print("baseline eval:", task.evaluate(seed, plot=True))

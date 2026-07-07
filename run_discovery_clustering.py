@@ -7,7 +7,7 @@ DQC1 normalized-trace kernel of dqc1.py and the objective is mean ARI).
     export ANTHROPIC_API_KEY=...            # (or OPENAI_API_KEY, GOOGLE_API_KEY, ...)
     export AGENT_MODEL=claude-opus-4-8      # any init_chat_model id
     export CLUSTER_DATASETS=spirals         # "spirals+moons+circles", ...
-    export CLUSTER_N_POINTS=60              # kernel is O(N^2); keep small
+    export CLUSTER_N_POINTS=100             # kernel is O(N^2); keep modest
     export CLUSTER_VARIANT=full             # "full" (DQC1-full; default) or "pre"
                                             # NOTE: "pre" can be feature-map
                                             # INSENSITIVE at small N (see
@@ -15,7 +15,9 @@ DQC1 normalized-trace kernel of dqc1.py and the objective is mean ARI).
     python run_discovery_clustering.py
 
 dqc1.py's own knobs (INIT_CLUSTERS, N_INIT, DATA_NOISE, DQC1_COMP_RANK, ...)
-still control the clustering pipeline itself.
+still control the clustering pipeline itself. Optional:
+    CLUSTER_MINIMIZE_RESOURCES=1   also ask the agent to minimize qubits/
+                                   gates/depth (secondary to ARI)
 """
 
 from __future__ import annotations
@@ -28,7 +30,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from AgentPipeline import AgentPipeline
-from clustering_task import (make_clustering_task, CLUSTER_DATASETS,
+from clustering_task import (make_clustering_task, classical_baselines,
+                             format_classical_report,
+                             save_seed_comparison_chart, CLUSTER_DATASETS,
                              CLUSTER_N_POINTS, CLUSTER_VARIANT)
 
 MODEL = os.environ.get("AGENT_MODEL") or os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8")
@@ -102,7 +106,7 @@ def build_pipeline() -> AgentPipeline:
         evaluate_kwargs={"plot": True},    # save a labels figure per evaluation
         # each trial runs the full DQC1 clustering pipeline (~1 min at the
         # default 60 points), so keep the per-session scratch budget small
-        max_session_trials=2,
+        max_session_trials=3,
     )
 
 
@@ -121,19 +125,52 @@ def print_seed_baselines(pipeline: AgentPipeline, best: dict) -> None:
         return (f"  {name:34s} ari={m['ari']:.4f} nmi={m['nmi']:.4f} "
                 f"gates={m.get('n_gates')} depth={m.get('depth')} | {per}")
 
-    lines = []
+    def _stat(m: dict) -> dict:
+        return {"ari": round(m["ari"], 4), "nmi": round(m["nmi"], 4),
+                "gates": m.get("n_gates"), "depth": m.get("depth")}
+
+    lines, stats = [], {}
     for name, code in task.seeds().items():
         # plot=True: each baseline saves a labeled figure into the run's
         # plots/ folder (clustering_<stamp>_iterseed_<name>.png), so seed
         # clusterings can be compared visually against the agent's iterN ones
-        lines.append(_row(name, task.evaluate(code, plot=True,
-                                              iteration=f"seed_{name}")))
+        m = task.evaluate(code, plot=True, iteration=f"seed_{name}")
+        lines.append(_row(name, m))
+        if m.get("ok"):
+            stats[name] = _stat(m)
     bm = best.get("metrics") or {}
     if best.get("code") and bm.get("ok"):
-        lines.append(_row(f">> agent best (variant #{best.get('variant', '?')})", bm))
+        tag = f">> agent best (variant #{best.get('variant', '?')})"
+        lines.append(_row(tag, bm))
+        stats[tag] = _stat(bm)
+    # bar chart of every seed + the agent, into the run's plots/ folder
+    chart = save_seed_comparison_chart(
+        stats, os.path.join(task.run_dir, "plots", "seed_comparison.png"),
+        note=f"{CLUSTER_DATASETS}, DQC1-{CLUSTER_VARIANT}, N={CLUSTER_N_POINTS}")
+    if chart:
+        lines.append(f"  [chart] {chart}")
+    # paste-ready refresh for clustering_task.SEED_BASELINE_STATS (seeds only)
+    lines.append("\n# paste over SEED_BASELINE_STATS in clustering_task.py:")
+    lines.append("SEED_BASELINE_STATS = {")
+    for n, s in stats.items():
+        if not n.startswith(">>"):
+            lines.append(f'    "{n}": {{"ari": {s["ari"]}, "nmi": {s["nmi"]}, '
+                         f'"gates": {s["gates"]}, "depth": {s["depth"]}}},')
+    lines.append("}")
     report = "\n".join(lines)
     print(report)
     task.log("SEED BASELINES", report)   # keep it in the run transcript too
+
+
+def print_classical_baselines(pipeline: AgentPipeline) -> None:
+    """Score dqc1.py's classical methods (Parzen FULL Gaussian + k-means) on
+    the same datasets; prints a table and saves a panel figure into the run's
+    plots/ folder."""
+    task = pipeline.task
+    res = classical_baselines(plot_dir=os.path.join(task.run_dir, "plots"))
+    report = format_classical_report(res)
+    print(report)
+    task.log("CLASSICAL BASELINES", report)
 
 
 if __name__ == "__main__":
@@ -161,5 +198,10 @@ if __name__ == "__main__":
     print("SEED BASELINES (same datasets, variant & pipeline settings)")
     print("=" * 72)
     print_seed_baselines(pipeline, best)
+
+    print("\n" + "=" * 72)
+    print("CLASSICAL BASELINES (Parzen FULL Gaussian + k-means, dqc1.py)")
+    print("=" * 72)
+    print_classical_baselines(pipeline)
 
     print("\nTranscript:", result["log_path"])

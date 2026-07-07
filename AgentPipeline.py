@@ -139,9 +139,11 @@ class PipelineState(TypedDict, total=False):
     #   run, official or not. If it still beats the official best at deploy
     #   time, deploy re-evaluates it officially (salvage) before summarizing.
     gen_no_tool: int
-    #   consecutive generate replies that neither ran a trial nor had anything
-    #   to submit. Guard against a model that only chats: after
-    #   max_gen_no_tool such replies we give up and deploy.
+    #   consecutive generate replies that needed a corrective nudge: no trial
+    #   run yet, a new design presented without calling evaluate, or
+    #   code-like text with no parsable block (malformed tool call). At
+    #   max_gen_no_tool we stop nudging: submit the session's best if any
+    #   trial ran, otherwise deploy.
 
     # --- official results (ONLY the evaluate node writes these) ---------------
     iteration: int
@@ -448,9 +450,9 @@ class AgentPipeline:
             args_lines.append(f"{k}:\n{v_str}" if "\n" in v_str else f"{k}: {v_str}")
         args_view = "\n".join(args_lines) or "(no args)"
         self.task.log(f"TOOL {call['name']} [tool {dt:.2f}s]",
-                      f"--- args ---\n{args_view}\n--- result ---\n{out[:1500]}")
+                      f"--- args ---\n{args_view}\n--- result ---\n{out[:]}")
         if note:
-            self._note(f"TOOL {call['name']}", out[:2000])
+            self._note(f"TOOL {call['name']}", out[:])
         try:
             parsed = json.loads(out)
         except (json.JSONDecodeError, TypeError):
@@ -580,25 +582,55 @@ class AgentPipeline:
         self.task.log(f"GENERATE (round {state.get('iteration', 0)}) [llm {dt:.2f}s]",
                       _text_of(resp))
         out: dict = {"messages": [resp]}
-        code = _extract_code(resp.content)
-        if code:
-            # an explicit code block in the reply overrides the last trial's
-            # code as the submission the evaluate node will officially score
-            out["current_code"] = code
         if _has_tool_calls(resp):
             out["gen_no_tool"] = 0
-        else:
+            return out
+
+        # Plain reply: either a real submission, or a slip that needs a
+        # corrective nudge. A model sometimes MEANS to call the tool but emits
+        # a malformed call (unclosed code fence / tool-XML as text) -- that
+        # must not silently end the session as a submission.
+        text = _text_of(resp)
+        block = _extract_code(text)
+        trials_used = state.get("session_trials", 0)
+        budget_left = trials_used < self.max_session_trials
+        sess_best_code = (state.get("session_best") or {}).get("code")
+
+        nudge = None
+        if trials_used == 0:
+            nudge = ("You have not run any trial this session. Reply by "
+                     f"calling `{self.evaluate_tool_name}` with your "
+                     f"candidate code (budget: {self.max_session_trials} "
+                     "trials per session, most promising first).")
+        elif budget_left and block and block not in (
+                sess_best_code, state.get("current_code")):
+            # a NEW, untested design presented as text: trial it, don't
+            # silently submit something else
+            nudge = ("You presented a new design but did not call the "
+                     f"`{self.evaluate_tool_name}` tool, so it was NOT "
+                     f"tested. You have "
+                     f"{self.max_session_trials - trials_used} trial(s) "
+                     f"left: call `{self.evaluate_tool_name}` with this "
+                     "exact code to test it, or reply with no code block to "
+                     "submit your best trial so far.")
+        elif budget_left and not block and self.entry_point in text:
+            # code-like text but no complete fenced block: usually a
+            # truncated or malformed tool call
+            nudge = ("Your reply contains code but no complete ```python "
+                     "block could be parsed (this often means a malformed "
+                     f"tool call). Call `{self.evaluate_tool_name}` with "
+                     "the complete code to test it.")
+
+        if nudge:
             out["gen_no_tool"] = state.get("gen_no_tool", 0) + 1
-            # A plain reply after >=1 trial is a SUBMISSION -> the router sends
-            # it to the official evaluate node. Only nudge a model that talks
-            # without having run any trial (nothing to submit yet).
-            if not state.get("session_trials"):
-                nudge = ("You have not run any trial this session. Reply by "
-                         f"calling `{self.evaluate_tool_name}` with your "
-                         f"candidate code (budget: {self.max_session_trials} "
-                         "trials per session, most promising first).")
-                self.task.log("WARNING (generate)", nudge)
-                out["messages"] = [resp, HumanMessage(content=nudge)]
+            self.task.log("WARNING (generate)", nudge)
+            out["messages"] = [resp, HumanMessage(content=nudge)]
+        else:
+            out["gen_no_tool"] = 0
+            if block:
+                # an explicit code block in a SUBMISSION overrides the
+                # session's best trial as the officially evaluated design
+                out["current_code"] = block
         return out
 
     def gen_tools_node(self, state: PipelineState) -> dict:
@@ -876,13 +908,19 @@ class AgentPipeline:
         return "generate"          # done researching -> design
 
     def _route_after_generate(self, state: PipelineState) -> str:
-        if _has_tool_calls(state["messages"][-1]):
+        last = state["messages"][-1]
+        if _has_tool_calls(last):
             return "gen_tools"      # research or trial call(s) -> executor
-        if state.get("session_trials", 0) > 0:
-            return "evaluate"       # plain reply after >=1 trial = submission
-        if state.get("gen_no_tool", 0) >= self.max_gen_no_tool:
-            return "deploy"         # refuses to run any trial -> give up
-        return "generate"           # nudged; let it try again
+        if isinstance(last, HumanMessage):
+            # generate_node injected a corrective nudge -> let it retry,
+            # unless it keeps slipping: then submit what we have (or give up)
+            if state.get("gen_no_tool", 0) >= self.max_gen_no_tool:
+                return ("evaluate" if state.get("session_trials", 0) > 0
+                        else "deploy")
+            return "generate"
+        # clean plain reply = submission (trials always > 0 here: a
+        # zero-trial plain reply is always nudged above)
+        return "evaluate" if state.get("session_trials", 0) > 0 else "generate"
 
     def _route_after_gen_tools(self, state: PipelineState) -> str:
         # ALL trial results return to generate -- including the last one, so it

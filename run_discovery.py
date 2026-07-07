@@ -10,8 +10,13 @@ Run the generic AgentPipeline on the concrete QML feature-map DiscoveryTask
     export AGENT_KERNEL=fidelity
     python run_discovery.py
 
+Optional:
+    QML_MINIMIZE_RESOURCES=1   also ask the agent to minimize qubits/gates/depth
+                               (secondary to accuracy)
+
 Swap make_qml_task(...) for any other DiscoveryTask to discover something else --
-the pipeline itself does not change.
+the pipeline itself does not change. Refresh seed baselines after changing
+dim/kernel:  python qml_task.py baselines
 """
 
 from __future__ import annotations
@@ -24,7 +29,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from AgentPipeline import AgentPipeline
-from qml_task import make_qml_task
+from qml_task import (make_qml_task, classical_baselines, format_classical_report,
+                      save_seed_comparison_chart, QML_DIM, QML_KERNEL)
 
 # AGENT_MODEL is provider-agnostic (init_chat_model). ANTHROPIC_MODEL kept as a
 # fallback for backward compatibility with older .env files.
@@ -32,8 +38,8 @@ MODEL = os.environ.get("AGENT_MODEL") or os.environ.get("ANTHROPIC_MODEL", "clau
 # Provider is optional: init_chat_model infers it from the model id (e.g. a
 # "claude-*" id -> "anthropic", "gpt-*" -> "openai"). Set it to disambiguate.
 PROVIDER = os.environ.get("AGENT_MODEL_PROVIDER") or None
-DIM = int(os.environ.get("AGENT_DIM", "2"))
-KERNEL = os.environ.get("AGENT_KERNEL", "fidelity")
+DIM = QML_DIM          # from AGENT_DIM (defined in qml_task, honors .env)
+KERNEL = QML_KERNEL    # from AGENT_KERNEL
 MAX_ITERS = int(os.environ.get("AGENT_MAX_ITERS", "6"))
 TEMPERATURE = float(os.environ.get("AGENT_TEMPERATURE", "0.4"))
 TRANSLATE_SPEC = os.environ.get("AGENT_TRANSLATE", "")  # e.g. "Port to PennyLane."
@@ -107,24 +113,60 @@ def build_pipeline() -> AgentPipeline:
 
 
 def print_seed_baselines(pipeline: AgentPipeline, best: dict) -> None:
-    """Evaluate every seed on the SAME dataset/kernel and print a comparison."""
+    """Evaluate every seed feature map on the SAME dataset/kernel and print a
+    comparison against the agent's best circuit; save a comparison chart and a
+    paste-ready SEED_BASELINE_STATS block into the run's plots/ folder."""
     task = pipeline.task
-    lines = []
+
+    def _row(name: str, m: dict) -> str:
+        if not m.get("ok"):
+            return f"  {name:34s} ERROR: {m.get('error')}"
+        return (f"  {name:34s} accuracy={m.get('accuracy'):<6} "
+                f"gates={m.get('n_gates')} depth={m.get('depth')}")
+
+    def _stat(m: dict) -> dict:
+        return {"accuracy": round(m["accuracy"], 4),
+                "gates": m.get("n_gates"), "depth": m.get("depth")}
+
+    lines, stats = [], {}
     for name, code in task.seeds().items():
-        m = task.evaluate(code)   # no plot=True: no figure spam for baselines
+        # plot=True: each baseline saves a kernel/prediction figure into the
+        # run's plots/ folder, comparable to the agent's iterN figures
+        m = task.evaluate(code, plot=True, iteration=f"seed_{name}")
+        lines.append(_row(name, m))
         if m.get("ok"):
-            lines.append(f"  {name:26s} accuracy={m.get('accuracy'):<8} "
-                         f"gates={m.get('n_gates')} depth={m.get('depth')}")
-        else:
-            lines.append(f"  {name:26s} ERROR: {m.get('error')}")
+            stats[name] = _stat(m)
     bm = best.get("metrics") or {}
     if best.get("code") and bm.get("ok"):
         tag = f">> agent best (variant #{best.get('variant', '?')})"
-        lines.append(f"  {tag:26s} accuracy={bm.get('accuracy'):<8} "
-                     f"gates={bm.get('n_gates')} depth={bm.get('depth')}")
+        lines.append(_row(tag, bm))
+        stats[tag] = _stat(bm)
+    chart = save_seed_comparison_chart(
+        stats, os.path.join(task.run_dir, "plots", "seed_comparison.png"),
+        note=f"dim={DIM}, kernel={KERNEL}")
+    if chart:
+        lines.append(f"  [chart] {chart}")
+    lines.append("\n# paste over SEED_BASELINE_STATS in qml_task.py:")
+    lines.append("SEED_BASELINE_STATS = {")
+    for n, s in stats.items():
+        if not n.startswith(">>"):
+            lines.append(f'    "{n}": {{"accuracy": {s["accuracy"]}, '
+                         f'"gates": {s["gates"]}, "depth": {s["depth"]}}},')
+    lines.append("}")
     report = "\n".join(lines)
     print(report)
     task.log("SEED BASELINES", report)   # keep it in the run transcript too
+
+
+def print_classical_baselines(pipeline: AgentPipeline) -> None:
+    """Score classical-kernel SVM references (RBF + linear) on the same data;
+    print a table and drop a config.txt into the run's plots/ folder."""
+    task = pipeline.task
+    res = classical_baselines(dim=DIM,
+                              plot_dir=os.path.join(task.run_dir, "plots"))
+    report = format_classical_report(res)
+    print(report)
+    task.log("CLASSICAL BASELINES", report)
 
 
 if __name__ == "__main__":
@@ -152,5 +194,10 @@ if __name__ == "__main__":
     print("SEED BASELINES (same dataset & kernel)")
     print("=" * 72)
     print_seed_baselines(pipeline, best)
+
+    print("\n" + "=" * 72)
+    print("CLASSICAL BASELINES (RBF + linear SVM, same data)")
+    print("=" * 72)
+    print_classical_baselines(pipeline)
 
     print("\nTranscript:", result["log_path"])
