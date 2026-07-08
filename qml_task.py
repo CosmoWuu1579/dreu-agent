@@ -50,7 +50,158 @@ from sklearn import svm
 from sklearn.metrics import accuracy_score
 
 from DiscoveryTask import DiscoveryTask
-from eval_harness import evaluate_feature_map, load_dataset, SEED_FEATURE_MAPS
+from eval_harness import (evaluate_feature_map, load_dataset,
+                          SEED_FEATURE_MAPS as _BASE_SEED_MAPS)
+
+
+# ---------------------------------------------------------------------------
+# Clustering feature maps, ported to the classification harness.
+# The clustering seeds (clustering_task.SEED_CLUSTER_FEATURE_MAPS) are written
+# for data in ~[-1, 1] with a 2*pi phase factor; classification data is in
+# ~[0, 2*pi] (see eval_harness.load_dataset -- NOT changed here). So each ported
+# map only adds ONE line inside build_circuit that linearly rescales x back to
+# ~[-1, 1]; the circuit structure is otherwise identical. (Kept as literal
+# strings, not imported from clustering_task, so this module stays free of the
+# heavy dqc1 / torch / fable import chain.)
+# ---------------------------------------------------------------------------
+def _port_to_classification(code: str) -> str:
+    """Insert an affine input rescale right after `def build_circuit(x):` so a
+    clustering seed (x~[-1,1]) runs correctly on classification data (x~[0,2pi]).
+    The rescale is LINEAR, so it is not 'classical nonlinear preprocessing'."""
+    marker = "def build_circuit(x):\n"
+    i = code.index(marker) + len(marker)
+    rescale = ("    x = np.asarray(x, dtype=float) / np.pi - 1.0  "
+               "# [0,2pi] -> ~[-1,1]\n")
+    return code[:i] + rescale + code[i:]
+
+
+_CLUSTER_MAPS_RAW = {
+    "cl_karimi_single_layer_pauli_z": """
+def build_circuit(x):
+    n = len(x)
+    qc = QuantumCircuit(n)
+    qc.h(range(n))
+    for i in range(n):
+        qc.rz(2 * np.pi * x[i], i)
+    for i in range(n):
+        for j in range(i + 1, n):
+            qc.rzz(2 * np.pi * x[i] * x[j], i, j)
+    return qc
+""",
+    "cl_zz_multi_layer": """
+def build_circuit(x):
+    n = len(x)
+    qc = QuantumCircuit(n)
+    qc.h(range(n))
+    for _ in range(2):
+        for q in range(n):
+            qc.rz(2 * np.pi * x[q], q)
+        for i in range(n):
+            for j in range(i + 1, n):
+                qc.rzz(2 * np.pi * x[i] * x[j], i, j)
+    return qc
+""",
+    "cl_zdiag_ising": """
+def build_circuit(x):
+    n = len(x)
+    qc = QuantumCircuit(n)
+    for _ in range(2):
+        for q in range(n):
+            qc.rz(2 * np.pi * x[q], q)
+        for q in range(0, n - 1, 2):
+            qc.cz(q, q + 1)
+        for q in range(1, n - 1, 2):
+            qc.cz(q, q + 1)
+    return qc
+""",
+#     "cl_rxryrz_reuploading": """
+# def build_circuit(x):
+#     n = len(x)
+#     qc = QuantumCircuit(n)
+#     for L in range(2):
+#         for q in range(n):
+#             a = x[q]
+#             qc.rx(2 * np.pi * (a + 0.1 * L), q)
+#             qc.ry(2 * np.pi * (a * a + 0.2 * L), q)
+#             qc.rz(2 * np.pi * (0.3 * a + 0.05 * L), q)
+#         for q in range(n - 1):
+#             qc.cx(q, q + 1)
+#     return qc
+# """,
+    "cl_pauli_higher_order": """
+def build_circuit(x):
+    n = len(x)
+    qc = QuantumCircuit(n)
+    for _ in range(2):
+        for q in range(n):
+            qc.rz(2 * np.pi * (0.6 * x[q] + 0.2 * (x[q] ** 3)), q)
+        for i in range(n):
+            for j in range(i + 1, n):
+                qc.rzz(2 * np.pi * (0.4 * x[i] * x[j]
+                                    + 0.1 * (x[i] ** 2 + x[j] ** 2)), i, j)
+    return qc
+""",
+    "cl_pauli_xz": """
+def build_circuit(x):
+    n = len(x)
+    qc = QuantumCircuit(n)
+    qc.h(range(n))
+    for i in range(n):
+        qc.rx(2 * np.pi * x[i], i)
+        qc.rz(2 * np.pi * x[i] ** 2, i)
+    for i in range(n):
+        for j in range(i + 1, n):
+            qc.h(i)
+            qc.rzz(2 * np.pi * x[i] * x[j], i, j)
+            qc.h(i)
+    return qc
+""",
+    "cl_iqp": """
+def build_circuit(x):
+    n = len(x)
+    qc = QuantumCircuit(n)
+    qc.h(range(n))
+    for i in range(n):
+        qc.rz(2 * np.pi * x[i], i)
+    for i in range(n):
+        for j in range(i + 1, n):
+            qc.rzz(2 * np.pi * x[i] * x[j], i, j)
+    return qc
+""",
+    "cl_hamiltonian_trotter": """
+def build_circuit(x):
+    n = len(x)
+    qc = QuantumCircuit(n)
+    for i in range(n):
+        qc.rz(2 * np.pi * x[i], i)
+        qc.rx(2 * np.pi * x[i] ** 2, i)
+    for i in range(n - 1):
+        qc.rzz(2 * np.pi * x[i] * x[i + 1], i, i + 1)
+    return qc
+""",
+    "cl_random_kitchen_sinks": """
+def build_circuit(x):
+    n = len(x)
+    rng = np.random.default_rng(123)
+    w_rx = rng.normal(size=n); b_rx = rng.uniform(0, 2 * np.pi, size=n)
+    w_ry = rng.normal(size=n); b_ry = rng.uniform(0, 2 * np.pi, size=n)
+    w_rz = rng.normal(size=n); b_rz = rng.uniform(0, 2 * np.pi, size=n)
+    qc = QuantumCircuit(n)
+    for i in range(n):
+        qc.rx(2 * np.pi * w_rx[i] * x[i] + b_rx[i], i)
+        qc.ry(2 * np.pi * w_ry[i] * x[i] + b_ry[i], i)
+        qc.rz(2 * np.pi * w_rz[i] * x[i] + b_rz[i], i)
+    for i in range(n - 1):
+        qc.cx(i, i + 1)
+    return qc
+""",
+}
+CLUSTER_DERIVED_FEATURE_MAPS = {
+    name: _port_to_classification(code)
+    for name, code in _CLUSTER_MAPS_RAW.items()
+}
+# the classification seed library = the original 3 + the ported clustering maps
+SEED_FEATURE_MAPS = {**_BASE_SEED_MAPS, **CLUSTER_DERIVED_FEATURE_MAPS}
 
 QML_DIM = int(os.environ.get("AGENT_DIM", "2"))
 QML_KERNEL = os.environ.get("AGENT_KERNEL", "fidelity").strip().lower()
@@ -129,13 +280,19 @@ def write_plot_config(plot_dir: str, **extra) -> str:
 # beat) and classical SVMs score ~0.15-0.25 (the ad_hoc set is classically
 # hard by design). Higher dim (e.g. AGENT_DIM=4) leaves real headroom -- run
 # `python qml_task.py baselines` to refresh for your dim/kernel.
-# paste over SEED_BASELINE_STATS in qml_task.py:
-SEED_BASELINE_CONFIG = "dim=3, kernel=dqc1, train=80, test=20, seed=12345"
+SEED_BASELINE_CONFIG = "dim=3, kernel=fidelity, train=80, test=20, seed=12345"
 SEED_BASELINE_STATS = {
-    "zz_l2": {"accuracy": 0.675, "qubits": 3, "gates": 30, "depth": 22},
-    "z_first_order": {"accuracy": 0.35, "qubits": 3, "gates": 6, "depth": 2},
-    "reupload_ring": {"accuracy": 0.525, "qubits": 3, "gates": 27, "depth": 15},
+    "z_first_order": {"accuracy": 0.45, "qubits": 3, "gates": 6, "depth": 2},
+    "cl_karimi_single_layer_pauli_z": {"accuracy": 0.625, "qubits": 3, "gates": 9, "depth": 5},
+    "cl_zz_multi_layer": {"accuracy": 0.425, "qubits": 3, "gates": 15, "depth": 9},
+    "cl_zdiag_ising": {"accuracy": 0.45, "qubits": 3, "gates": 10, "depth": 6},
+    "cl_pauli_higher_order": {"accuracy": 0.375, "qubits": 3, "gates": 12, "depth": 8},
+    "cl_pauli_xz": {"accuracy": 0.575, "qubits": 3, "gates": 18, "depth": 10},
+    "cl_iqp": {"accuracy": 0.625, "qubits": 3, "gates": 9, "depth": 5},
+    "cl_hamiltonian_trotter": {"accuracy": 0.475, "qubits": 3, "gates": 8, "depth": 4},
+    "cl_random_kitchen_sinks": {"accuracy": 0.575, "qubits": 3, "gates": 11, "depth": 5},
 }
+
 
 def _annotated_seeds(seed_stats: dict | None) -> dict:
     """The seed library with each map's measured accuracy prepended as a
@@ -311,17 +468,27 @@ def _system_prompts(dim: int, seed_stats: dict | None = None,
         table = "\n".join(f"  - {n}: accuracy={s['accuracy']:.3f}, "
                           f"qubits={s.get('qubits', '?')}, gates={s['gates']}, "
                           f"depth={s['depth']}" for n, s in rows)
-        beat_note = (f" The measured best seed is {best_name} at accuracy "
-                     f"{best_s['accuracy']:.3f}; the goal is to EXCEED it.")
+        beat_note = (
+            f" Your objective is to IMPROVE on the best design so far -- from the "
+            f"start that is the strongest seed, {best_name} (accuracy "
+            f"{best_s['accuracy']:.3f}, {best_s['gates']} gates, depth "
+            f"{best_s['depth']}) -- by matching or beating its accuracy AND making "
+            f"it leaner: treat that seed's {best_s['gates']} gates and depth "
+            f"{best_s['depth']} as the numbers to undercut (not just the overall "
+            f"resource limits), trimming any gate or layer that does not earn its "
+            f"accuracy.")
         baseline_block = (
             f"\n\n# Seed baselines to beat ({SEED_BASELINE_CONFIG})\n{table}\n"
-            f"NUMBER TO BEAT: {best_name} at accuracy {best_s['accuracy']:.3f} -- "
-            f"success = accuracy strictly ABOVE it. First reason about why the "
-            f"strong seeds win and weak ones fail, then extend/hybridize/rethink "
-            f"them.\nSUBMISSION RULE: submit your OWN circuit, never a seed "
-            f"verbatim (nor one with only cosmetic edits). Even if nothing beat "
-            f"{best_name}, submit your best original and say it fell short -- "
-            f"returning a seed is an automatic failure.")
+            f"NUMBER TO BEAT: {best_name} at accuracy {best_s['accuracy']:.3f} "
+            f"(its cost: {best_s['gates']} gates, depth {best_s['depth']}) -- "
+            f"success = accuracy strictly ABOVE it, and a strong result also comes "
+            f"in UNDER {best_s['gates']} gates / depth {best_s['depth']} for the "
+            f"SAME OR BETTER accuracy. First reason about why the strong seeds win "
+            f"and weak ones fail, then extend/hybridize/rethink them, always "
+            f"asking which gates you can remove.\nSUBMISSION RULE: submit your OWN "
+            f"circuit, never a seed verbatim (nor one with only cosmetic edits). "
+            f"Even if nothing beat {best_name}, submit your best original and say "
+            f"it fell short -- returning a seed is an automatic failure.")
     return {
         "explore": (
             f"You are a research assistant for designing quantum feature maps for a "
@@ -335,19 +502,30 @@ def _system_prompts(dim: int, seed_stats: dict | None = None,
             f"You are an expert quantum circuit designer. Design a quantum feature "
             f"map for a {dim}-feature binary classification task that MAXIMIZES SVM "
             f"test accuracy while keeping the gate count modest.\n"
-            f"Strategy: (1) LOCAL SEARCH FIRST -- your first trial each session is "
-            f"the best seed with ONE change (one rotation, one entangler, one "
-            f"layer); only redesign after scoring that. (2) WATCH OVERFITTING / "
-            f"KERNEL CONCENTRATION -- the test set is small and very deep/wide "
-            f"circuits overfit or drive the Gram matrix near-constant (lost class "
-            f"separation); if a bigger circuit scores WORSE, simplify.\n"
+            f"Strategy: (1) BUILD ON THE BEST -- start each session from the "
+            f"current best design (on the FIRST session that is the strongest "
+            f"seed below) and refine it (one rotation, entangler, or layer) to "
+            f"beat it: push accuracy higher and, where you can, use fewer gates "
+            f"and lower depth. Prefer improving what already works, but it is NOT "
+            f"a cage -- if the best is weak or you have a promising idea, a fresh "
+            f"design is fine. (2) WATCH OVERFITTING / KERNEL CONCENTRATION -- the "
+            f"test set is small and very deep/wide circuits overfit or drive the "
+            f"Gram matrix near-constant (lost class separation); if a bigger "
+            f"circuit scores WORSE, simplify.\n"
             f"Contract: define exactly one build_circuit(x)->QuantumCircuit; x is "
             f"a length-{dim} array; {dim}-{q_hi} qubits; no imports (`np`, "
             f"`QuantumCircuit` in scope), no measurements, trainable params, or "
             f"classical nonlinear preprocessing of x. Present each candidate as a "
-            f"```python block, THEN call `evaluate` on it. Refine from the scores, "
-            f"or reply WITHOUT a tool call to submit."
-            + baseline_block + resource_block
+            f"```python block, THEN call `evaluate` on it. Submit by replying "
+            f"WITHOUT a tool call. Prefer a trial that beats the best, or a "
+            f"promising-but-worse trial that opens a useful direction. "
+            f"Resubmitting the current best UNCHANGED is a last resort -- "
+            f"justified only when this session's trials were genuinely poor or "
+            f"the direction was subpar, never as a default. Do NOT resubmit the "
+            f"same design session after session: if small tweaks keep failing "
+            f"to beat it, that is your cue to make a bold, structurally "
+            f"different change next session, not another minor variation."
+            + beat_note + baseline_block + resource_block
         ),
         "review": (
             "You are a critical reviewer of quantum feature-map designs for a "

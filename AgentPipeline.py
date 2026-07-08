@@ -598,6 +598,13 @@ class AgentPipeline:
         # duplicated into the accumulating message thread. Raw tool dumps stay
         # out (they can be huge and low-signal) -- those are one
         # `check_explorer_notes` call away.
+        #
+        # The system prompt stays STATIC (task instructions + explorer notes).
+        # The dynamic "best design so far / build on it" reminder is NOT added
+        # here -- it lives in the message thread (injected by review_node at
+        # session start), so it appears in correct chronological order (right
+        # after the variant it names, not at position 0 before that variant's
+        # own messages) and does not invalidate the cached system prompt.
         sys_content = self.task.system_prompt("generate")
         notes = (state.get("notes") or "").strip()
         if notes:
@@ -605,21 +612,6 @@ class AgentPipeline:
             if self.use_notes_tool:
                 sys_content += ("\n\n(You can re-read these notes anytime with "
                                 "`check_explorer_notes`.)")
-        # From session 2 on, remind the designer that the best-so-far is already
-        # BANKED by the system (it is what the final report uses) -- so it must
-        # try to BEAT it with a new design, never waste a session resubmitting
-        # it. This is the fix for "generate keeps re-returning a prior session's
-        # best": re-submitting adds nothing, the system already kept that design.
-        best = state.get("best") or {}
-        if best.get("code"):
-            sys_content += (
-                f"\n\n# Best design so far: variant #{best.get('variant', '?')} "
-                f"({self.target_metric}={best.get(self.target_metric)})\n"
-                "The system has ALREADY saved this and will report it if nothing "
-                "beats it -- you NEVER need to resubmit it. Each session, spend "
-                "your trials trying to EXCEED it with a genuinely DIFFERENT "
-                "design; resubmitting the current best (or a cosmetic tweak) "
-                "wastes the session and is not progress.")
         self._log_system("generate", sys_content)
         bound = self.generate_llm.bind_tools(self._design_tools())
         t0 = time.perf_counter()
@@ -903,15 +895,48 @@ class AgentPipeline:
         )
         note = _text_of(resp)
         self.task.log(f"REVIEW (round {state.get('iteration', 0)}) [llm {dt:.2f}s]", note)
+        # design-thread messages that lead into the NEXT session's generate:
+        # the reviewer's feedback, then (chronologically here, NOT in the system
+        # prompt) the "build on the current best" reminder.
+        feedback_msg = (
+            f"Reviewer feedback on variant #{m.get('variant', '?')} ({submitted}) "
+            f"-- NOT necessarily your latest attempt:\n{note}")
+        design_msgs = [HumanMessage(content=feedback_msg)]
+        foundation = self._best_so_far_note(state)
+        if foundation:
+            design_msgs.append(HumanMessage(content=foundation))
+        # log the design-thread hand-off exactly as the NEXT generate will see
+        # it, so the transcript shows what actually steered the next session --
+        # the reviewer feedback and the "current best, build on it" reminder
+        # (previously these were fed to generate but never recorded).
+        self.task.log(
+            f"NEXT SESSION input (best-so-far: variant "
+            f"#{(state.get('best') or {}).get('variant', '?')})",
+            feedback_msg + (f"\n\n{foundation}" if foundation else ""))
         return {"review": note,
                 # reviewer's own memory: the question + its distilled answer
                 # (a fresh AIMessage, so no dangling tool-call pairs persist)
                 "review_messages": [HumanMessage(content=prompt),
                                     AIMessage(content=note)],
-                "messages": [HumanMessage(content=(
-                    f"Reviewer feedback on variant "
-                    f"#{m.get('variant', '?')} ({submitted}) -- NOT necessarily "
-                    f"your latest attempt:\n{note}"))]}
+                "messages": design_msgs}
+
+    def _best_so_far_note(self, state: PipelineState) -> str:
+        """Factual 'current best' line, injected into the DESIGN THREAD at
+        session start (not the system prompt) so it sits after the variant it
+        names -- correct chronological order -- and keeps the system prompt
+        static. The how-to (build on it / when to resubmit) lives in the task's
+        generate prompt; this only supplies the live numbers. Empty until a
+        best exists (session 1, where the task prompt points at the best seed)."""
+        best = state.get("best") or {}
+        if not best.get("code"):
+            return ""
+        bm = best.get("metrics") or {}
+        return (
+            f"Current best is variant #{best.get('variant', '?')} "
+            f"({self.target_metric}={best.get(self.target_metric)}, "
+            f"gates={bm.get('n_gates')}, depth={bm.get('depth')}) -- it is saved "
+            "and cannot be lost. Build on it per your Strategy (refine it to beat "
+            "it, or try a fresh direction if it is weak).")
 
     def deploy_node(self, state: PipelineState) -> dict:
         best = dict(state.get("best") or {})

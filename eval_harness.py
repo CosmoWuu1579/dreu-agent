@@ -297,21 +297,21 @@ def evaluate_feature_map(code: str, data=None, device: str | None = None,
 # ---------------------------------------------------------------------------
 SEED_FEATURE_MAPS = {
     # The paper's ZZ-style l=2 map (first + second order, full entanglement).
-    "zz_l2": """
-def build_circuit(x):
-    n = len(x)
-    qc = QuantumCircuit(n)
-    for _ in range(2):                     # l = 2 layers
-        for i in range(n):
-            qc.h(i)
-            qc.rz(2 * x[i], i)
-        for i in range(n):
-            for j in range(i + 1, n):
-                qc.cx(i, j)
-                qc.rz(2 * (np.pi - x[i]) * (np.pi - x[j]), j)
-                qc.cx(i, j)
-    return qc
-""",
+#     "zz_l2": """
+# def build_circuit(x):
+#     n = len(x)
+#     qc = QuantumCircuit(n)
+#     for _ in range(2):                     # l = 2 layers
+#         for i in range(n):
+#             qc.h(i)
+#             qc.rz(2 * x[i], i)
+#         for i in range(n):
+#             for j in range(i + 1, n):
+#                 qc.cx(i, j)
+#                 qc.rz(2 * (np.pi - x[i]) * (np.pi - x[j]), j)
+#                 qc.cx(i, j)
+#     return qc
+# """,
     # First-order only (Z feature map): cheap baseline, no entanglement.
     "z_first_order": """
 def build_circuit(x):
@@ -323,22 +323,22 @@ def build_circuit(x):
     return qc
 """,
     # Data re-uploading with a linear CNOT chain and RY/RZ rotations.
-    "reupload_ring": """
-def build_circuit(x):
-    n = len(x)
-    qc = QuantumCircuit(n)
-    for _ in range(3):                     # 3 re-uploading blocks
-        for i in range(n):
-            qc.ry(2 * x[i], i)
-            qc.rz(2 * x[i], i)
-        for i in range(n):
-            qc.cx(i, (i + 1) % n)          # ring of CNOTs
-    return qc
-""",
+#     "reupload_ring": """
+# def build_circuit(x):
+#     n = len(x)
+#     qc = QuantumCircuit(n)
+#     for _ in range(3):                     # 3 re-uploading blocks
+#         for i in range(n):
+#             qc.ry(2 * x[i], i)
+#             qc.rz(2 * x[i], i)
+#         for i in range(n):
+#             qc.cx(i, (i + 1) % n)          # ring of CNOTs
+#     return qc
+# """,
 }
 
 # Backwards-compatible default seed.
-SEED_FEATURE_MAP = SEED_FEATURE_MAPS["zz_l2"]
+# SEED_FEATURE_MAP = SEED_FEATURE_MAPS["zz_l2"]
 
 
 def seed_library_text() -> str:
