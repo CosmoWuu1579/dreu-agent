@@ -72,7 +72,10 @@ TRIALS vs VARIANTS (two separate evaluations):
              place best-so-far / iteration are updated. Resets the session.
   review   : LLM critique with its own persistent thread; runs after every
              evaluated batch. Feedback is injected into the design thread.
-  deploy   : final summary (+ optional user deploy_prompt + translate LLM).
+  deploy   : final summary, written BY the generate agent (its system prompt +
+             full design thread) so it narrates what it actually did; the
+             deploy system prompt supplies the report framing. (+ optional user
+             deploy_prompt + translate LLM.)
 
 Every LLM call is logged with its wall time ([llm X.XXs]); every individual
 tool call likewise ([tool X.XXs]).
@@ -205,7 +208,7 @@ class AgentPipeline:
         use_notes_tool: bool = False,            # give generate a re-read tool
         explorer_llm=None,
         review_llm=None,
-        deploy_llm=None,
+        deploy_llm=None,        # accepted for compat; deploy now uses generate_llm
         translate_llm=None,
         explorer_tools: Optional[list] = None,   # research tools for the explorer
         generate_tools: Optional[list] = None,   # research tools for generate
@@ -229,6 +232,8 @@ class AgentPipeline:
         self.generate_llm = generate_llm
         self.explorer_llm = explorer_llm or generate_llm
         self.review_llm = review_llm or generate_llm
+        # deploy writes its summary as the generate agent (see deploy_node), so
+        # deploy_llm is retained only for backward-compatible call sites
         self.deploy_llm = deploy_llm or generate_llm
         self.translate_llm = translate_llm
         self.use_explorer = use_explorer
@@ -592,6 +597,19 @@ class AgentPipeline:
             out.append(HumanMessage(content=warning))
         return {"explore_messages": out}
 
+    def _generate_system(self, state: PipelineState) -> str:
+        """The generate agent's system prompt: task instructions + the
+        explorer's distilled notes. Built here (not inline) so the deploy node
+        can reuse the EXACT same prompt and stay the same agent."""
+        sys_content = self.task.system_prompt("generate")
+        notes = (state.get("notes") or "").strip()
+        if notes:
+            sys_content += "\n\n# Research notes from the explorer\n" + notes
+            if self.use_notes_tool:
+                sys_content += ("\n\n(You can re-read these notes anytime with "
+                                "`check_explorer_notes`.)")
+        return sys_content
+
     def generate_node(self, state: PipelineState) -> dict:
         # the explorer's FULL written notes ride in the system prompt: present
         # from the very first generate call, resent on every call, but never
@@ -605,13 +623,7 @@ class AgentPipeline:
         # session start), so it appears in correct chronological order (right
         # after the variant it names, not at position 0 before that variant's
         # own messages) and does not invalidate the cached system prompt.
-        sys_content = self.task.system_prompt("generate")
-        notes = (state.get("notes") or "").strip()
-        if notes:
-            sys_content += "\n\n# Research notes from the explorer\n" + notes
-            if self.use_notes_tool:
-                sys_content += ("\n\n(You can re-read these notes anytime with "
-                                "`check_explorer_notes`.)")
+        sys_content = self._generate_system(state)
         self._log_system("generate", sys_content)
         bound = self.generate_llm.bind_tools(self._design_tools())
         t0 = time.perf_counter()
@@ -969,19 +981,24 @@ class AgentPipeline:
 
         extra = (f"\nAdditional user instructions for deployment:\n{self.deploy_prompt}"
                  if self.deploy_prompt else "")
-        deploy_system = self.task.system_prompt("deploy")
-        self._log_system("deploy", deploy_system)
+        # Write the summary AS the generate agent: same system prompt it used
+        # all run + its full design thread, so it narrates what it actually did
+        # (every trial, review, dead-end) rather than describing the winning
+        # circuit from JSON. What the deploy step should PRODUCE (the report
+        # framing) is given in the user turn below; tools are NOT bound.
+        gen_system = self._generate_system(state)
+        self._log_system("generate", gen_system)   # log if it changed since last
+        deploy_ask = self.task.system_prompt("deploy")
         t0 = time.perf_counter()
-        summary_resp = self.deploy_llm.invoke([
-            SystemMessage(content=deploy_system),
-            HumanMessage(content=(
-                f"The search finished after {iteration} official "
-                f"variant(s) ({self._eval_count} trial evaluations in total). "
-                f"The best artifact was variant #{best.get('variant', '?')}; "
-                f"its code and stats:\n{json.dumps(best, indent=2)}\n"
-                f"Summarize what was designed (mention which variant won), the "
-                f"final stats, and the rationale.{extra}")),
-        ])
+        summary_resp = self.generate_llm.invoke(
+            [SystemMessage(content=gen_system)]
+            + state.get("messages", [])
+            + [HumanMessage(content=(
+                f"The search is now complete: {iteration} official variant(s) "
+                f"over {self._eval_count} trial evaluation(s). The best artifact "
+                f"was variant #{best.get('variant', '?')}; its code and stats:\n"
+                f"{json.dumps(best, indent=2)}\n\n"
+                f"Now write the final report. {deploy_ask}{extra}"))])
         summary = _text_of(summary_resp)
         self.task.log(f"DEPLOY summary [llm {time.perf_counter() - t0:.2f}s]", summary)
 
