@@ -71,8 +71,27 @@ CLUSTER_VARIANT = os.environ.get("CLUSTER_VARIANT", "full").strip().lower()
 # depth as a SECONDARY objective (ARI always stays primary)
 CLUSTER_MINIMIZE_RESOURCES = os.environ.get("CLUSTER_MINIMIZE_RESOURCES", "0") != "0"
 
-# The DQC1 kernel circuit holds 2n+1 qubits (probe + system + purification),
-# so cap the feature-map width to keep each kernel entry cheap to simulate.
+
+def _limit(name: str) -> int | None:
+    """A hard resource cap from the env: unset / "" / "0" -> None (no limit)."""
+    v = os.environ.get(name, "").strip()
+    return int(v) if v and v != "0" else None
+
+
+# HARD resource budgets, ONLY enforced when CLUSTER_MINIMIZE_RESOURCES is on. A
+# circuit that busts any of these is marked ok=False ("not viable") so it cannot
+# win. Unlike the supervised task (fast eval), clustering is minutes per run, so
+# an over-budget circuit is REJECTED UP FRONT (before the O(N^2) pipeline) --
+# the agent still gets the qubit/gate/depth counts and the "shrink it" message.
+# Set them in .env, e.g. CLUSTER_MAX_QUBITS=4.
+CLUSTER_MAX_QUBITS = _limit("CLUSTER_MAX_QUBITS")
+CLUSTER_MAX_GATES = _limit("CLUSTER_MAX_GATES")
+CLUSTER_MAX_DEPTH = _limit("CLUSTER_MAX_DEPTH")
+
+# The DQC1 kernel circuit holds 2n+1 qubits (probe + system + purification), so
+# cap the feature-map width to keep each kernel entry cheap to simulate. This is
+# a HARD computational ceiling, always enforced (raises), separate from the
+# optional CLUSTER_MAX_QUBITS economy cap above.
 MAX_QUBITS = 6
 
 
@@ -120,6 +139,10 @@ def pipeline_config(**extra) -> dict:
         "CLUSTER_N_POINTS": CLUSTER_N_POINTS,
         "CLUSTER_VARIANT": CLUSTER_VARIANT,
         "CLUSTER_MINIMIZE_RESOURCES": CLUSTER_MINIMIZE_RESOURCES,
+        # hard resource caps (None = unlimited; only enforced when minimize on)
+        "CLUSTER_MAX_QUBITS": CLUSTER_MAX_QUBITS,
+        "CLUSTER_MAX_GATES": CLUSTER_MAX_GATES,
+        "CLUSTER_MAX_DEPTH": CLUSTER_MAX_DEPTH,
         "MAX_QUBITS": MAX_QUBITS,
         # dqc1.py knobs that drive the kernel / entropy / clustering
         "DATA_NOISE": dqc1.DATA_NOISE,
@@ -182,13 +205,24 @@ def _save_cluster_plot(results: dict, iteration=None, plot_dir: str = "plots"):
 # ---------------------------------------------------------------------------
 def evaluate_clustering(code: str, datasets: dict | None = None,
                         variant: str = CLUSTER_VARIANT, plot: bool = False,
-                        iteration=None, plot_dir: str = "plots") -> dict:
+                        iteration=None, plot_dir: str = "plots",
+                        max_qubits: int | None = None,
+                        max_gates: int | None = None,
+                        max_depth: int | None = None) -> dict:
     """Compile a feature map, cluster with the DQC1 pipeline, score with ARI.
 
     The candidate map is routed through dqc1.build_feature_map, so every
     kernel entry and purity estimate in dqc1.py uses the agent's circuit.
     Workers stay serial (kernel_workers=purity_workers=1): joblib subprocesses
     would re-import dqc1 and lose the patched feature map.
+
+    max_qubits / max_gates / max_depth: HARD resource budgets (None = no
+        limit). A circuit that exceeds any set limit is REJECTED UP FRONT with
+        ok=False + a "not viable" error (the O(N^2) clustering is NOT run --
+        it's minutes of compute a losing circuit does not deserve), but the
+        result still carries the qubit/gate/depth counts and the evaluate call
+        still counts. Wired by clustering_task only when
+        CLUSTER_MINIMIZE_RESOURCES is on.
     """
     try:
         build_circuit = compile_feature_map(code)
@@ -202,6 +236,31 @@ def evaluate_clustering(code: str, datasets: dict | None = None,
             raise ValueError(f"use at most {MAX_QUBITS} qubits "
                              f"(got {probe.num_qubits}); the DQC1 kernel "
                              f"simulates 2n+1 qubits per entry")
+
+        # HARD resource budget: reject before the expensive clustering, but
+        # report the counts + violation so the agent knows exactly what to cut.
+        n_qubits = probe.num_qubits
+        n_gates = int(sum(probe.count_ops().values()))
+        depth = probe.depth()
+        violations = []
+        if max_qubits is not None and n_qubits > max_qubits:
+            violations.append(f"qubits {n_qubits} > limit {max_qubits}")
+        if max_gates is not None and n_gates > max_gates:
+            violations.append(f"gates {n_gates} > limit {max_gates}")
+        if max_depth is not None and depth > max_depth:
+            violations.append(f"depth {depth} > limit {max_depth}")
+        if violations:
+            return {
+                "ok": False,
+                "resource_violation": violations,
+                "n_qubits": n_qubits, "n_gates": n_gates, "depth": depth,
+                "variant": variant,
+                "error": ("NOT VIABLE -- circuit exceeds the resource budget: "
+                          + "; ".join(violations) + ". It was NOT clustered "
+                          "(over-budget circuits are rejected before the "
+                          "expensive pipeline) and cannot be submitted. Reduce "
+                          "qubits/gates/depth and try a smaller circuit."),
+            }
 
         # route dqc1's kernel through the candidate map (kind/layers ignored)
         dqc1.build_feature_map = lambda x, kind, layers: build_circuit(
@@ -400,15 +459,15 @@ def build_circuit(x):
 # ---------------------------------------------------------------------------
 SEED_BASELINE_CONFIG = "spirals, DQC1-full, N=80, DATA_NOISE=0.0, RANDOM_STATE=0"
 SEED_BASELINE_STATS = {
-    "karimi_single_layer_pauli_z": {"ari": 0.2168, "nmi": 0.204, "gates": 5, "depth": 3},
-    "zz_multi_layer": {"ari": 0.0394, "nmi": 0.0411, "gates": 8, "depth": 5},
-    "zdiag_ising": {"ari": -0.0036, "nmi": 0.0063, "gates": 6, "depth": 4},
-    "rxryrz_reuploading": {"ari": 0.0398, "nmi": 0.0431, "gates": 14, "depth": 8},
-    "pauli_higher_order": {"ari": -0.0011, "nmi": 0.0086, "gates": 6, "depth": 4},
-    "pauli_xz": {"ari": 0.1519, "nmi": 0.1896, "gates": 9, "depth": 6},
-    "iqp": {"ari": 0.2168, "nmi": 0.204, "gates": 5, "depth": 3},
-    "hamiltonian_trotter": {"ari": 0.1519, "nmi": 0.1896, "gates": 5, "depth": 3},
-    "random_kitchen_sinks": {"ari": -0.0098, "nmi": 0.0006, "gates": 7, "depth": 4},
+    "karimi_single_layer_pauli_z": {"ari": 0.2168, "nmi": 0.204, "qubits": 2, "gates": 5, "depth": 3},
+    "zz_multi_layer": {"ari": 0.0394, "nmi": 0.0411, "qubits": 2, "gates": 8, "depth": 5},
+    "zdiag_ising": {"ari": -0.0036, "nmi": 0.0063, "qubits": 2, "gates": 6, "depth": 4},
+    "rxryrz_reuploading": {"ari": 0.0398, "nmi": 0.0431, "qubits": 2, "gates": 14, "depth": 8},
+    "pauli_higher_order": {"ari": -0.0011, "nmi": 0.0086, "qubits": 2, "gates": 6, "depth": 4},
+    "pauli_xz": {"ari": 0.1519, "nmi": 0.1896, "qubits": 2, "gates": 9, "depth": 6},
+    "iqp": {"ari": 0.2168, "nmi": 0.204, "qubits": 2, "gates": 5, "depth": 3},
+    "hamiltonian_trotter": {"ari": 0.1519, "nmi": 0.1896, "qubits": 2, "gates": 5, "depth": 3},
+    "random_kitchen_sinks": {"ari": -0.0098, "nmi": 0.0006, "qubits": 2, "gates": 7, "depth": 4},
 }
 
 
@@ -423,7 +482,8 @@ def _annotated_seeds(seed_stats: dict | None) -> dict:
         if isinstance(s, dict) and "ari" in s:
             header = (f"# measured ({SEED_BASELINE_CONFIG}): "
                       f"mean ARI={s['ari']:.3f}, NMI={s['nmi']:.3f}, "
-                      f"gates={s['gates']}, depth={s['depth']}")
+                      f"qubits={s.get('qubits', '?')}, gates={s['gates']}, "
+                      f"depth={s['depth']}")
         else:
             header = "# (no measured baseline yet)"
         out[name] = f"\n{header}\n{code.strip()}\n"
@@ -496,9 +556,10 @@ def compute_seed_baselines(datasets: str = CLUSTER_DATASETS,
                                 plot_dir=plot_dir or "plots")
         if m.get("ok"):
             stats[name] = {"ari": round(m["ari"], 4), "nmi": round(m["nmi"], 4),
-                           "gates": m["n_gates"], "depth": m["depth"]}
+                           "qubits": m["n_qubits"], "gates": m["n_gates"],
+                           "depth": m["depth"]}
             print(f"  {name:34s} ari={m['ari']:.4f} nmi={m['nmi']:.4f} "
-                  f"gates={m['n_gates']} depth={m['depth']}")
+                  f"qubits={m['n_qubits']} gates={m['n_gates']} depth={m['depth']}")
         else:
             stats[name] = {"error": m.get("error")}
             print(f"  {name:34s} ERROR: {m.get('error')}")
@@ -512,7 +573,8 @@ def compute_seed_baselines(datasets: str = CLUSTER_DATASETS,
     for n, s in stats.items():
         if "ari" in s:
             print(f'    "{n}": {{"ari": {s["ari"]}, "nmi": {s["nmi"]}, '
-                  f'"gates": {s["gates"]}, "depth": {s["depth"]}}},')
+                  f'"qubits": {s["qubits"]}, "gates": {s["gates"]}, '
+                  f'"depth": {s["depth"]}}},')
     print("}")
     return stats
 
@@ -594,9 +656,30 @@ def _system_prompts(dataset_names: list[str], variant: str,
                     seed_stats: dict | None = None,
                     minimize_resources: bool = False) -> dict[str, str]:
     sets = ", ".join(dataset_names)
+    # effective upper qubit bound stated in the contract: the hard MAX_QUBITS
+    # ceiling, tightened to CLUSTER_MAX_QUBITS when that economy cap is set
+    q_hi = MAX_QUBITS
+    if minimize_resources and CLUSTER_MAX_QUBITS is not None:
+        q_hi = min(MAX_QUBITS, CLUSTER_MAX_QUBITS)
     # optional secondary objective: circuit economy (toggle, off by default)
     resource_block, resource_note = "", ""
     if minimize_resources:
+        # hard, enforced budgets (only the ones actually set in .env)
+        limits = []
+        if CLUSTER_MAX_QUBITS is not None:
+            limits.append(f"at most {CLUSTER_MAX_QUBITS} qubits")
+        if CLUSTER_MAX_GATES is not None:
+            limits.append(f"at most {CLUSTER_MAX_GATES} gates")
+        if CLUSTER_MAX_DEPTH is not None:
+            limits.append(f"depth at most {CLUSTER_MAX_DEPTH}")
+        limit_line = ""
+        if limits:
+            limit_line = (
+                "\nHARD RESOURCE LIMITS (ENFORCED): your circuit must use "
+                + ", ".join(limits) + ". A circuit that exceeds ANY of these is "
+                "REJECTED before clustering and marked NOT VIABLE (ok=false) no "
+                "matter what -- it cannot be submitted or win, and the evaluate "
+                "result will say by how much it went over. Stay within budget.")
         resource_block = (
             "\n\n# Secondary objective: circuit economy\n"
             "Among candidates with comparable mean ARI, PREFER fewer qubits, "
@@ -604,7 +687,8 @@ def _system_prompts(dataset_names: list[str], variant: str,
             "evaluation result). Never trade ARI away for economy: beat the "
             "baseline first, then simplify -- drop gates that do not change "
             "the score, use the fewest qubits that work, and prefer shallow "
-            "layers over stacked ones.")
+            "layers over stacked ones."
+            + limit_line)
         resource_note = (" Also flag waste: qubits, gates, or depth that do "
                          "not earn their ARI.")
     # "numbers to beat", built from the measured seed baselines (if provided)
@@ -614,27 +698,20 @@ def _system_prompts(dataset_names: list[str], variant: str,
     if rows:
         best_name, best_s = max(rows, key=lambda kv: kv[1]["ari"])
         table = "\n".join(f"  - {n}: mean ARI={s['ari']:.3f}, "
-                          f"NMI={s['nmi']:.3f}, gates={s['gates']}, "
-                          f"depth={s['depth']}" for n, s in rows)
+                          f"NMI={s['nmi']:.3f}, qubits={s.get('qubits', '?')}, "
+                          f"gates={s['gates']}, depth={s['depth']}"
+                          for n, s in rows)
         beat_note = (f" The measured best seed is {best_name} at mean ARI "
                      f"{best_s['ari']:.3f}; the goal is to EXCEED it.")
         baseline_block = (
-            f"\n\n# Measured seed baselines ({SEED_BASELINE_CONFIG})\n"
-            f"Every seed in the library has already been scored by this exact "
-            f"evaluator:\n{table}\n"
-            f"THE NUMBER TO BEAT: {best_name}, mean ARI {best_s['ari']:.3f}. "
-            f"A candidate only counts as a success if its mean ARI EXCEEDS "
-            f"that. Before designing, reason about WHY the strong seeds win and "
-            f"the weak ones fail, then extend, hybridize, or rethink them.\n"
-            f"HARD RULE ON YOUR SUBMISSION: the circuit you finally submit MUST "
-            f"be your own design -- never a seed copied verbatim, and never a "
-            f"seed with only comments, names, or whitespace changed. This holds "
-            f"EVEN IF none of your trials beat {best_name}: in that case submit "
-            f"the best ORIGINAL circuit you built and state plainly that it did "
-            f"not beat the seed. Falling back to a seed as your answer is an "
-            f"automatic failure -- the seeds are already known, so re-reporting "
-            f"one teaches nothing. Your job is to produce a NEW circuit and an "
-            f"honest measurement of it.")
+            f"\n\n# Seed baselines to beat ({SEED_BASELINE_CONFIG})\n{table}\n"
+            f"NUMBER TO BEAT: {best_name} at mean ARI {best_s['ari']:.3f} -- "
+            f"success = mean ARI strictly ABOVE it. First reason about why the "
+            f"strong seeds win and weak ones fail, then extend/hybridize/rethink "
+            f"them.\nSUBMISSION RULE: submit your OWN circuit, never a seed "
+            f"verbatim (nor one with only cosmetic edits). Even if nothing beat "
+            f"{best_name}, submit your best original and say it fell short -- "
+            f"returning a seed is an automatic failure.")
     return {
         "explore": (
             f"You are a research assistant for designing quantum feature maps for "
@@ -650,43 +727,29 @@ def _system_prompts(dataset_names: list[str], variant: str,
             + beat_note
         ),
         "generate": (
-            f"You are an expert quantum circuit designer. Design the quantum feature "
-            f"map U(x) used inside a DQC1 normalized-trace kernel "
-            f"K(x,x') = |tr(U(x)U(x')^dag)|/2^n for UNSUPERVISED entropy-based "
-            f"clustering (Renyi-2, DQC1-{variant}) on these 2D synthetic datasets: "
-            f"{sets}. MAXIMIZE the mean Adjusted Rand Index (ARI) against the "
-            f"ground-truth classes.\n"
-            f"Key physics: only the relative unitary U(x)U(x')^dag matters, so "
-            f"global structure comes from how phases depend on x. Diagonal-only "
-            f"maps give K = product of cosines of phase differences; non-diagonal "
-            f"rotations (RX/RY) change this qualitatively.\n"
-            f"Search strategy (IMPORTANT):\n"
-            f"- LOCAL SEARCH FIRST. Your first trial each session should be the "
-            f"current best design -- start from the strongest seed -- with ONE "
-            f"targeted change (e.g. a bandwidth scalar on the angles, one extra "
-            f"layer, one feature swapped). Establish that baseline BEFORE any "
-            f"larger redesign; do not blue-sky a brand-new architecture until a "
-            f"minimal edit of the best seed has been scored.\n"
-            f"- SMALL BEATS BIG. The DQC1 trace kernel |tr(U U'^dag)|/2^n "
-            f"CONCENTRATES toward zero as the circuit grows -- more qubits, "
-            f"gates, and depth tend to flatten the kernel (all entries converge) "
-            f"and destroy the discriminability that separates clusters. Prefer "
-            f"2-3 qubits and at most ~2 layers. When a bigger circuit scores "
-            f"WORSE, that is kernel concentration, not too little expressivity: "
-            f"shrink, do not grow.\n"
-            f"Contract for the code you return:\n"
-            f"- Define exactly one function build_circuit(x) -> QuantumCircuit.\n"
-            f"- x is a length-2 numpy array with entries normalized to about "
-            f"[-1, 1]. Use at least 2 qubits, at most {MAX_QUBITS} (the DQC1 "
-            f"kernel simulates 2n+1 qubits per entry, so stay small).\n"
-            f"- NO imports; `np` and `QuantumCircuit` are in scope. No "
-            f"measurements, no trainable parameters.\n"
-            f"- Present each candidate as a ```python code block, THEN call the "
-            f"`evaluate` tool with that exact code to score it (it runs the full "
-            f"DQC1 clustering pipeline; each call takes a while, so choose "
-            f"variants deliberately). Metrics include per-dataset ARI/NMI and a "
-            f"k-means reference ARI. After you see the scores, refine and "
-            f"evaluate again, or reply WITHOUT a tool call when you are satisfied."
+            f"You are an expert quantum circuit designer. Design the feature map "
+            f"U(x) inside a DQC1 normalized-trace kernel "
+            f"K(x,x')=|tr(U(x)U(x')^dag)|/2^n for unsupervised Renyi-2 entropy "
+            f"clustering (DQC1-{variant}) on 2D datasets: {sets}. MAXIMIZE mean "
+            f"ARI vs ground truth.\n"
+            f"Physics: only the relative unitary U(x)U(x')^dag matters. "
+            f"Diagonal-only maps give K = product of cosines of phase diffs; "
+            f"RX/RY rotations change this qualitatively.\n"
+            f"Strategy: (1) LOCAL SEARCH FIRST -- your first trial each session is "
+            f"the best seed with ONE change (bandwidth scalar, a layer, a swapped "
+            f"feature); only redesign after scoring that. (2) SMALL BEATS BIG -- "
+            f"the trace kernel CONCENTRATES toward zero as circuits grow, "
+            f"flattening K and killing separability; prefer 2-3 qubits, <=2 "
+            f"layers. A bigger circuit scoring WORSE means concentration -- "
+            f"shrink, don't grow.\n"
+            f"Contract: define exactly one build_circuit(x)->QuantumCircuit; x is "
+            f"a length-2 array ~[-1,1]; 2-{q_hi} qubits (the kernel "
+            f"simulates 2n+1 per entry); no imports (`np`, `QuantumCircuit` in "
+            f"scope), no measurements or trainable params. Present each candidate "
+            f"as a ```python block, THEN call `evaluate` on it (runs the full "
+            f"pipeline, slow -- choose deliberately; metrics include per-dataset "
+            f"ARI/NMI + a k-means reference). Refine from the scores, or reply "
+            f"WITHOUT a tool call to submit."
             + baseline_block + resource_block
         ),
         "review": (
@@ -696,7 +759,8 @@ def _system_prompts(dataset_names: list[str], variant: str,
             "improvement -- e.g. phase scaling (kernel bandwidth of the trace "
             "kernel), higher-order polynomial Z terms, non-diagonal rotations, "
             "radial/angular encodings for rings, or fewer layers if the kernel "
-            "is concentrating. Two sentences max. If it errored, state the fix."
+            "is concentrating. Be concise but give as much detail as the "
+            "improvement warrants. If it errored, state the fix."
             + beat_note + resource_note
         ),
         "deploy": (
@@ -729,6 +793,11 @@ def make_clustering_task(datasets: str = CLUSTER_DATASETS,
         # (`task` is bound below, before the first evaluation runs); plots/
         # subfolder matches qml_task.py's convention
         kwargs.setdefault("plot_dir", os.path.join(task.run_dir, "plots"))
+        # enforce the hard resource budget ONLY when minimize_resources is on
+        if minimize_resources:
+            kwargs.setdefault("max_qubits", CLUSTER_MAX_QUBITS)
+            kwargs.setdefault("max_gates", CLUSTER_MAX_GATES)
+            kwargs.setdefault("max_depth", CLUSTER_MAX_DEPTH)
         return evaluate_clustering(code, datasets=data, variant=variant,
                                    *args, **kwargs)
 
@@ -745,6 +814,17 @@ def make_clustering_task(datasets: str = CLUSTER_DATASETS,
         ],
         documentation_source="qiskit (QuantumCircuit API)",
     )
+    # record the resource-limit state in the run transcript (also snapshotted
+    # into each config.txt via pipeline_config)
+    if minimize_resources:
+        task.log("RESOURCE LIMITS (enforced)",
+                 f"max_qubits={CLUSTER_MAX_QUBITS}  max_gates={CLUSTER_MAX_GATES}"
+                 f"  max_depth={CLUSTER_MAX_DEPTH}   (None = no limit; an "
+                 f"over-budget circuit is rejected before clustering, marked "
+                 f"ok=false so it cannot win)")
+    else:
+        task.log("RESOURCE LIMITS",
+                 "CLUSTER_MINIMIZE_RESOURCES off -- no caps enforced")
     return task
 
 

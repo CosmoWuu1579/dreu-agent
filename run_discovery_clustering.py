@@ -18,6 +18,9 @@ dqc1.py's own knobs (INIT_CLUSTERS, N_INIT, DATA_NOISE, DQC1_COMP_RANK, ...)
 still control the clustering pipeline itself. Optional:
     CLUSTER_MINIMIZE_RESOURCES=1   also ask the agent to minimize qubits/
                                    gates/depth (secondary to ARI)
+    AGENT_EXPLORER_MODEL=...       cheap model for explorer/review/deploy to
+    AGENT_REVIEW_MODEL=...         cut cost (each defaults to AGENT_MODEL);
+    AGENT_DEPLOY_MODEL=...         e.g. claude-haiku-4-5-20251001
 """
 
 from __future__ import annotations
@@ -34,19 +37,31 @@ from clustering_task import (make_clustering_task, classical_baselines,
                              format_classical_report,
                              save_seed_comparison_chart, CLUSTER_DATASETS,
                              CLUSTER_N_POINTS, CLUSTER_VARIANT)
+# RAG / web-search / docs tools (db/agent.py): rag_search hits the local PDF
+# knowledge base (Chroma + OpenAI embeddings), web_search is Tavily, qiskit_docs
+# is the offline Qiskit API reference. Import is cheap (retrievers are lazy).
+from db.agent import rag_search, web_search, qiskit_docs
 
 MODEL = os.environ.get("AGENT_MODEL") or os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8")
 PROVIDER = os.environ.get("AGENT_MODEL_PROVIDER") or None
+# Per-role model overrides -- each defaults to AGENT_MODEL. Point the cheap
+# roles at a small model (e.g. AGENT_EXPLORER_MODEL=claude-haiku-4-5-20251001)
+# to cut cost; generate keeps AGENT_MODEL since it does the real design work.
+EXPLORER_MODEL = os.environ.get("AGENT_EXPLORER_MODEL") or MODEL
+REVIEW_MODEL = os.environ.get("AGENT_REVIEW_MODEL") or MODEL
+DEPLOY_MODEL = os.environ.get("AGENT_DEPLOY_MODEL") or MODEL
 MAX_ITERS = int(os.environ.get("AGENT_MAX_ITERS", "6"))
 TEMPERATURE = float(os.environ.get("AGENT_TEMPERATURE", "0.4"))
 TRANSLATE_SPEC = os.environ.get("AGENT_TRANSLATE", "")
 USE_EXPLORER = os.environ.get("AGENT_USE_EXPLORER", "1") != "0"
 DEPLOY_PROMPT = os.environ.get("AGENT_DEPLOY_PROMPT", "")
+# per-session cap on non-evaluate (research) tool calls; AgentPipeline default 4
+MAX_RESEARCH = int(os.environ.get("AGENT_MAX_RESEARCH", "4"))
 
 
-def make_llm(temperature: float, max_tokens: int):
+def make_llm(temperature: float, max_tokens: int, model: str | None = None):
     return init_chat_model(
-        MODEL, model_provider=PROVIDER,
+        model or MODEL, model_provider=PROVIDER,
         temperature=temperature, max_tokens=max_tokens,
     )
 
@@ -56,34 +71,30 @@ def build_pipeline() -> AgentPipeline:
                                 n_points=CLUSTER_N_POINTS,
                                 variant=CLUSTER_VARIANT)
 
-    # ---- optional tools the nodes may call (any can be omitted) ----
-    @tool
-    def documentation_lookup(query: str) -> str:
-        """Look up quantum-library API documentation relevant to `query`."""
-        hits = task.retrieve_docs(query, k=3)
-        return "\n".join(hits) if hits else f"[no docs indexed yet] source: {task.documentation_source()}"
-
-    @tool
-    def past_papers_lookup(query: str) -> str:
-        """Retrieve relevant prior research / papers for `query`."""
-        hits = task.retrieve(query, k=3)
-        return "\n".join(hits) if hits else f"[no papers indexed yet] sources: {task.knowledge_sources()}"
-
+    # ---- a domain-expert persona (LLM) the reviewer can consult ----
     @tool
     def expert_consult(topic: str) -> str:
         """Consult a domain expert persona for improvement ideas on `topic`."""
-        expert = make_llm(temperature=0.5, max_tokens=512)
+        expert = make_llm(temperature=0.5, max_tokens=512, model=REVIEW_MODEL)
         msg = expert.invoke(
             "You are an expert in quantum kernels and entropy-based clustering "
             f"(DQC1, Renyi-2). In 2 sentences, advise on: {topic}")
         return msg.content if isinstance(msg.content, str) else str(msg.content)
 
-    # research_tools = [documentation_lookup, past_papers_lookup]
-    research_tools = []
-    generate_llm = make_llm(temperature=TEMPERATURE, max_tokens=4096)
-    explorer_llm = make_llm(temperature=0.5, max_tokens=2048)
-    review_llm = make_llm(temperature=0.3, max_tokens=1024)
-    deploy_llm = make_llm(temperature=0.2, max_tokens=1024)
+    # Per-node toolsets (AgentPipeline also auto-adds view_seed_library to the
+    # explorer + generate, check_explorer_notes to generate, and the evaluate
+    # tool to generate):
+    #   explorer : web_search + rag_search  (gather external + internal research)
+    #   generate : rag_search + qiskit_docs (knowledge base + API reference)
+    #   review   : rag_search + expert_consult
+    explorer_tools = [web_search, rag_search]
+    generate_tools = [rag_search, qiskit_docs]
+    review_tools = [rag_search, ]
+
+    generate_llm = make_llm(temperature=TEMPERATURE, max_tokens=4096)  # AGENT_MODEL
+    explorer_llm = make_llm(temperature=0.5, max_tokens=2048, model=EXPLORER_MODEL)
+    review_llm = make_llm(temperature=0.3, max_tokens=1024, model=REVIEW_MODEL)
+    deploy_llm = make_llm(temperature=0.2, max_tokens=1024, model=DEPLOY_MODEL)
     translate_llm = make_llm(temperature=0.2, max_tokens=2048) if TRANSLATE_SPEC else None
 
     return AgentPipeline(
@@ -94,9 +105,9 @@ def build_pipeline() -> AgentPipeline:
         review_llm=review_llm,
         deploy_llm=deploy_llm,
         translate_llm=translate_llm,
-        explorer_tools=research_tools,
-        generate_tools=research_tools,
-        review_tools=[expert_consult],
+        explorer_tools=explorer_tools,
+        generate_tools=generate_tools,
+        review_tools=review_tools,
         deploy_prompt=DEPLOY_PROMPT or None,
         max_iters=MAX_ITERS,
         target_metric="ari",               # mean ARI over CLUSTER_DATASETS
@@ -107,6 +118,7 @@ def build_pipeline() -> AgentPipeline:
         # each trial runs the full DQC1 clustering pipeline (~1 min at the
         # default 60 points), so keep the per-session scratch budget small
         max_session_trials=3,
+        max_session_research=MAX_RESEARCH,
     )
 
 
@@ -123,11 +135,13 @@ def print_seed_baselines(pipeline: AgentPipeline, best: dict) -> None:
             f"{d}: ARI={s['ARI']:.3f} (kmeans {s['kmeans_ARI']:.3f})"
             for d, s in (m.get("per_dataset") or {}).items())
         return (f"  {name:34s} ari={m['ari']:.4f} nmi={m['nmi']:.4f} "
-                f"gates={m.get('n_gates')} depth={m.get('depth')} | {per}")
+                f"qubits={m.get('n_qubits')} gates={m.get('n_gates')} "
+                f"depth={m.get('depth')} | {per}")
 
     def _stat(m: dict) -> dict:
         return {"ari": round(m["ari"], 4), "nmi": round(m["nmi"], 4),
-                "gates": m.get("n_gates"), "depth": m.get("depth")}
+                "qubits": m.get("n_qubits"), "gates": m.get("n_gates"),
+                "depth": m.get("depth")}
 
     lines, stats = [], {}
     for name, code in task.seeds().items():
@@ -155,7 +169,8 @@ def print_seed_baselines(pipeline: AgentPipeline, best: dict) -> None:
     for n, s in stats.items():
         if not n.startswith(">>"):
             lines.append(f'    "{n}": {{"ari": {s["ari"]}, "nmi": {s["nmi"]}, '
-                         f'"gates": {s["gates"]}, "depth": {s["depth"]}}},')
+                         f'"qubits": {s["qubits"]}, "gates": {s["gates"]}, '
+                         f'"depth": {s["depth"]}}},')
     lines.append("}")
     report = "\n".join(lines)
     print(report)

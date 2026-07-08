@@ -14,6 +14,10 @@ loads .env itself):
     AGENT_KERNEL            "fidelity" (scalable search objective) | "dqc1"
     QML_MINIMIZE_RESOURCES  1 -> also push for fewer qubits/gates/lower depth
                             (secondary to accuracy)
+    QML_MAX_QUBITS          hard cap (only enforced when MINIMIZE_RESOURCES=1):
+    QML_MAX_GATES           a circuit over ANY set cap is still scored but
+    QML_MAX_DEPTH           marked ok=false "NOT VIABLE" so it cannot win.
+                            Unset / 0 = no limit for that resource.
 
 Refresh the seed baselines after changing dim/kernel/data:
     python qml_task.py baselines     # per-seed figures + paste-ready stats
@@ -54,6 +58,20 @@ QML_KERNEL = os.environ.get("AGENT_KERNEL", "fidelity").strip().lower()
 # as a SECONDARY objective (accuracy always stays primary)
 QML_MINIMIZE_RESOURCES = os.environ.get("QML_MINIMIZE_RESOURCES", "0") != "0"
 
+
+def _limit(name: str) -> int | None:
+    """A hard resource cap from the env: unset / "" / "0" -> None (no limit)."""
+    v = os.environ.get(name, "").strip()
+    return int(v) if v and v != "0" else None
+
+
+# HARD resource budgets, ONLY enforced when QML_MINIMIZE_RESOURCES is on. A
+# circuit that busts any of these is scored but marked ok=False ("not viable"),
+# so it cannot win. Set them in .env, e.g. QML_MAX_QUBITS=6.
+QML_MAX_QUBITS = _limit("QML_MAX_QUBITS")
+QML_MAX_GATES = _limit("QML_MAX_GATES")
+QML_MAX_DEPTH = _limit("QML_MAX_DEPTH")
+
 # dataset shape (kept fixed so baselines are reproducible)
 TRAIN_SIZE = int(os.environ.get("QML_TRAIN_SIZE", "40"))
 TEST_SIZE = int(os.environ.get("QML_TEST_SIZE", "10"))
@@ -77,6 +95,10 @@ def pipeline_config(**extra) -> dict:
         "AGENT_DIM": QML_DIM,
         "AGENT_KERNEL": QML_KERNEL,
         "QML_MINIMIZE_RESOURCES": QML_MINIMIZE_RESOURCES,
+        # hard resource caps (None = unlimited; only enforced when minimize on)
+        "QML_MAX_QUBITS": QML_MAX_QUBITS,
+        "QML_MAX_GATES": QML_MAX_GATES,
+        "QML_MAX_DEPTH": QML_MAX_DEPTH,
         "TRAIN_SIZE": TRAIN_SIZE,
         "TEST_SIZE": TEST_SIZE,
         "DATA_SEED": DATA_SEED,
@@ -110,9 +132,9 @@ def write_plot_config(plot_dir: str, **extra) -> str:
 # paste over SEED_BASELINE_STATS in qml_task.py:
 SEED_BASELINE_CONFIG = "dim=3, kernel=dqc1, train=80, test=20, seed=12345"
 SEED_BASELINE_STATS = {
-    "zz_l2": {"accuracy": 0.675, "gates": 30, "depth": 22},
-    "z_first_order": {"accuracy": 0.35, "gates": 6, "depth": 2},
-    "reupload_ring": {"accuracy": 0.525, "gates": 27, "depth": 15},
+    "zz_l2": {"accuracy": 0.675, "qubits": 3, "gates": 30, "depth": 22},
+    "z_first_order": {"accuracy": 0.35, "qubits": 3, "gates": 6, "depth": 2},
+    "reupload_ring": {"accuracy": 0.525, "qubits": 3, "gates": 27, "depth": 15},
 }
 
 def _annotated_seeds(seed_stats: dict | None) -> dict:
@@ -125,7 +147,8 @@ def _annotated_seeds(seed_stats: dict | None) -> dict:
         s = seed_stats.get(name)
         if isinstance(s, dict) and "accuracy" in s:
             header = (f"# measured ({SEED_BASELINE_CONFIG}): "
-                      f"accuracy={s['accuracy']:.3f}, gates={s['gates']}, "
+                      f"accuracy={s['accuracy']:.3f}, "
+                      f"qubits={s.get('qubits', '?')}, gates={s['gates']}, "
                       f"depth={s['depth']}")
         else:
             header = "# (no measured baseline yet)"
@@ -182,9 +205,10 @@ def compute_seed_baselines(dim: int = QML_DIM, kernel: str = QML_KERNEL,
                                  plot_dir=plot_dir or "plots")
         if m.get("ok"):
             stats[name] = {"accuracy": round(m["accuracy"], 4),
-                           "gates": m["n_gates"], "depth": m["depth"]}
+                           "qubits": m["n_qubits"], "gates": m["n_gates"],
+                           "depth": m["depth"]}
             print(f"  {name:20s} accuracy={m['accuracy']:.4f} "
-                  f"gates={m['n_gates']} depth={m['depth']}")
+                  f"qubits={m['n_qubits']} gates={m['n_gates']} depth={m['depth']}")
         else:
             stats[name] = {"error": m.get("error")}
             print(f"  {name:20s} ERROR: {m.get('error')}")
@@ -198,7 +222,8 @@ def compute_seed_baselines(dim: int = QML_DIM, kernel: str = QML_KERNEL,
     for n, s in stats.items():
         if "accuracy" in s:
             print(f'    "{n}": {{"accuracy": {s["accuracy"]}, '
-                  f'"gates": {s["gates"]}, "depth": {s["depth"]}}},')
+                  f'"qubits": {s["qubits"]}, "gates": {s["gates"]}, '
+                  f'"depth": {s["depth"]}}},')
     print("}")
     return stats
 
@@ -242,16 +267,39 @@ def format_classical_report(res: dict) -> str:
 # ---------------------------------------------------------------------------
 def _system_prompts(dim: int, seed_stats: dict | None = None,
                     minimize_resources: bool = False) -> dict[str, str]:
+    # effective upper qubit bound stated in the contract: the enforced hard cap
+    # when one is set (minimize on), else the soft dim+4 default
+    q_hi = (QML_MAX_QUBITS if (minimize_resources and QML_MAX_QUBITS is not None)
+            else dim + 4)
     # optional secondary objective: circuit economy (toggle, off by default)
     resource_block, resource_note = "", ""
     if minimize_resources:
+        # hard, enforced budgets (only the ones actually set in .env)
+        limits = []
+        if QML_MAX_QUBITS is not None:
+            limits.append(f"at most {QML_MAX_QUBITS} qubits")
+        if QML_MAX_GATES is not None:
+            limits.append(f"at most {QML_MAX_GATES} gates")
+        if QML_MAX_DEPTH is not None:
+            limits.append(f"depth at most {QML_MAX_DEPTH}")
+        limit_line = ""
+        if limits:
+            limit_line = (
+                "\nHARD RESOURCE LIMITS (ENFORCED): your circuit must use "
+                + ", ".join(limits) + ". A circuit that exceeds ANY of these is "
+                "still scored but marked NOT VIABLE (ok=false) no matter how "
+                "accurate it is -- it cannot be submitted or win, and the "
+                "evaluate result will say by how much it went over. Stay within "
+                "budget; these limits override the qubit range in the contract "
+                "above.")
         resource_block = (
             "\n\n# Secondary objective: circuit economy\n"
             "Among candidates with comparable accuracy, PREFER fewer qubits, "
             "fewer gates, and lower depth (all reported in every evaluation "
             "result). Never trade accuracy away for economy: beat the baseline "
             "first, then simplify -- drop gates that do not change the score, "
-            "use the fewest qubits that work, and prefer shallow layers.")
+            "use the fewest qubits that work, and prefer shallow layers."
+            + limit_line)
         resource_note = (" Also flag waste: qubits, gates, or depth that do "
                          "not earn their accuracy.")
     # "number to beat", built from the measured seed baselines (if provided)
@@ -261,27 +309,19 @@ def _system_prompts(dim: int, seed_stats: dict | None = None,
     if rows:
         best_name, best_s = max(rows, key=lambda kv: kv[1]["accuracy"])
         table = "\n".join(f"  - {n}: accuracy={s['accuracy']:.3f}, "
-                          f"gates={s['gates']}, depth={s['depth']}"
-                          for n, s in rows)
+                          f"qubits={s.get('qubits', '?')}, gates={s['gates']}, "
+                          f"depth={s['depth']}" for n, s in rows)
         beat_note = (f" The measured best seed is {best_name} at accuracy "
                      f"{best_s['accuracy']:.3f}; the goal is to EXCEED it.")
         baseline_block = (
-            f"\n\n# Measured seed baselines ({SEED_BASELINE_CONFIG})\n"
-            f"Every seed in the library has already been scored by this exact "
-            f"evaluator:\n{table}\n"
-            f"THE NUMBER TO BEAT: {best_name}, accuracy {best_s['accuracy']:.3f}. "
-            f"A candidate only counts as a success if its accuracy EXCEEDS "
-            f"that. Before designing, reason about WHY the strong seeds win and "
-            f"the weak ones fail, then extend, hybridize, or rethink them.\n"
-            f"HARD RULE ON YOUR SUBMISSION: the circuit you finally submit MUST "
-            f"be your own design -- never a seed copied verbatim, and never a "
-            f"seed with only comments, names, or whitespace changed. This holds "
-            f"EVEN IF none of your trials beat {best_name}: in that case submit "
-            f"the best ORIGINAL circuit you built and state plainly that it did "
-            f"not beat the seed. Falling back to a seed as your answer is an "
-            f"automatic failure -- the seeds are already known, so re-reporting "
-            f"one teaches nothing. Your job is to produce a NEW circuit and an "
-            f"honest measurement of it.")
+            f"\n\n# Seed baselines to beat ({SEED_BASELINE_CONFIG})\n{table}\n"
+            f"NUMBER TO BEAT: {best_name} at accuracy {best_s['accuracy']:.3f} -- "
+            f"success = accuracy strictly ABOVE it. First reason about why the "
+            f"strong seeds win and weak ones fail, then extend/hybridize/rethink "
+            f"them.\nSUBMISSION RULE: submit your OWN circuit, never a seed "
+            f"verbatim (nor one with only cosmetic edits). Even if nothing beat "
+            f"{best_name}, submit your best original and say it fell short -- "
+            f"returning a seed is an automatic failure.")
     return {
         "explore": (
             f"You are a research assistant for designing quantum feature maps for a "
@@ -295,36 +335,27 @@ def _system_prompts(dim: int, seed_stats: dict | None = None,
             f"You are an expert quantum circuit designer. Design a quantum feature "
             f"map for a {dim}-feature binary classification task that MAXIMIZES SVM "
             f"test accuracy while keeping the gate count modest.\n"
-            f"Search strategy (IMPORTANT):\n"
-            f"- LOCAL SEARCH FIRST. Your first trial each session should be the "
-            f"current best design -- start from the strongest seed -- with ONE "
-            f"targeted change (one encoding rotation, one entangler, one extra "
-            f"layer). Establish that baseline BEFORE any larger redesign; do not "
-            f"blue-sky a new architecture until a minimal edit of the best seed "
-            f"has been scored.\n"
-            f"- WATCH FOR OVERFITTING / KERNEL CONCENTRATION. The test set is "
-            f"small, and very deep or wide circuits can either overfit or drive "
-            f"the quantum kernel toward a near-constant Gram matrix that loses "
-            f"class separation. If a bigger circuit scores WORSE, simplify "
-            f"rather than pile on more gates.\n"
-            f"Contract for the code you return:\n"
-            f"- Define exactly one function build_circuit(x) -> QuantumCircuit.\n"
-            f"- x is a length-{dim} numpy array. Use at least {dim} qubits, at most {dim + 4}.\n"
-            f"- NO imports; `np` and `QuantumCircuit` are in scope. No measurements, "
-            f"no trainable parameters, no classical nonlinear preprocessing of x.\n"
-            f"- Present each candidate as a ```python code block, THEN call the "
-            f"`evaluate` tool with that exact code to score it. After you see the "
-            f"scores, refine and evaluate again, or reply WITHOUT a tool call when "
-            f"you are satisfied. You may use the lookup tools first if you need "
-            f"more information."
+            f"Strategy: (1) LOCAL SEARCH FIRST -- your first trial each session is "
+            f"the best seed with ONE change (one rotation, one entangler, one "
+            f"layer); only redesign after scoring that. (2) WATCH OVERFITTING / "
+            f"KERNEL CONCENTRATION -- the test set is small and very deep/wide "
+            f"circuits overfit or drive the Gram matrix near-constant (lost class "
+            f"separation); if a bigger circuit scores WORSE, simplify.\n"
+            f"Contract: define exactly one build_circuit(x)->QuantumCircuit; x is "
+            f"a length-{dim} array; {dim}-{q_hi} qubits; no imports (`np`, "
+            f"`QuantumCircuit` in scope), no measurements, trainable params, or "
+            f"classical nonlinear preprocessing of x. Present each candidate as a "
+            f"```python block, THEN call `evaluate` on it. Refine from the scores, "
+            f"or reply WITHOUT a tool call to submit."
             + baseline_block + resource_block
         ),
         "review": (
             "You are a critical reviewer of quantum feature-map designs for a "
             "quantum-kernel SVM. Given a candidate and its measured accuracy/gate "
             "stats, give ONE specific, actionable improvement (entanglement pattern, "
-            "data re-uploading, encoding rotations, or lower depth). Two sentences of "
-            "feedback, plus a brief note of any expert findings worth remembering. "
+            "data re-uploading, encoding rotations, or lower depth). Be concise "
+            "but give as much detail as the improvement warrants, plus a brief "
+            "note of any expert findings worth remembering. "
             "If it errored, state the concrete fix."
             + beat_note + resource_note
         ),
@@ -357,6 +388,11 @@ def make_qml_task(dim: int = QML_DIM, kernel: str = QML_KERNEL,
         # figures live in the task's per-run folder, next to the transcript;
         # plots/ subfolder mirrors clustering_task.py
         plot_dir = kwargs.setdefault("plot_dir", os.path.join(task.run_dir, "plots"))
+        # enforce the hard resource budget ONLY when minimize_resources is on
+        if minimize_resources:
+            kwargs.setdefault("max_qubits", QML_MAX_QUBITS)
+            kwargs.setdefault("max_gates", QML_MAX_GATES)
+            kwargs.setdefault("max_depth", QML_MAX_DEPTH)
         m = evaluate_feature_map(code, data=data, kernel=kernel, *args, **kwargs)
         if kwargs.get("plot"):
             write_plot_config(plot_dir)    # config.txt next to the kernel figures
@@ -371,6 +407,15 @@ def make_qml_task(dim: int = QML_DIM, kernel: str = QML_KERNEL,
         knowledge_sources=["arXiv:2210.09275", "arXiv:1804.11326 (Havlicek)"],
         documentation_source="qiskit (QuantumCircuit API)",
     )
+    # record the resource-limit state in the run transcript (also snapshotted
+    # into each config.txt via pipeline_config)
+    if minimize_resources:
+        task.log("RESOURCE LIMITS (enforced)",
+                 f"max_qubits={QML_MAX_QUBITS}  max_gates={QML_MAX_GATES}  "
+                 f"max_depth={QML_MAX_DEPTH}   (None = no limit; an over-budget "
+                 f"circuit is still scored but marked ok=false so it cannot win)")
+    else:
+        task.log("RESOURCE LIMITS", "QML_MINIMIZE_RESOURCES off -- no caps enforced")
     return task
 
 

@@ -203,7 +203,10 @@ def _save_kernel_image(Ktr, Xte, y_pred, yte, acc, kernel, iteration, plot_dir):
 
 def evaluate_feature_map(code: str, data=None, device: str | None = None,
                          kernel: str = "fidelity", plot: bool = False,
-                         iteration=None, plot_dir: str = "plots") -> dict:
+                         iteration=None, plot_dir: str = "plots",
+                         max_qubits: int | None = None,
+                         max_gates: int | None = None,
+                         max_depth: int | None = None) -> dict:
     """Compile, simulate, score. Returns metrics or an 'error' field on failure.
 
     kernel="fidelity" (default): scalable fidelity kernel -- the agent's search
@@ -211,6 +214,14 @@ def evaluate_feature_map(code: str, data=None, device: str | None = None,
         (reproduces arXiv:2210.09275; slower, concentrates with n).
     plot=True: save a kernel-matrix + prediction figure to
         plot_dir/kernel_<date>[_iterN].png and return its path under 'plot_path'.
+
+    max_qubits / max_gates / max_depth: HARD resource budgets (None = no
+        limit). The circuit is STILL run and scored, but if it exceeds any set
+        limit the result is marked ok=False with a "not viable" error listing
+        the violation(s) -- so an over-budget circuit can never win, yet the
+        evaluate call still counts (the agent sees its score AND the overage
+        and must resubmit smaller). Wired by qml_task only when
+        QML_MINIMIZE_RESOURCES is on.
     """
     try:
         build_circuit = compile_feature_map(code)
@@ -254,6 +265,26 @@ def evaluate_feature_map(code: str, data=None, device: str | None = None,
         if plot:
             metrics["plot_path"] = _save_kernel_image(
                 Ktr, Xte, y_pred, yte, acc, kernel, iteration, plot_dir)
+
+        # HARD resource budget: the circuit already ran (metrics are real), but
+        # if it busts any set limit, mark it non-viable so it cannot win -- the
+        # agent still gets its score plus a clear "shrink it" instruction.
+        violations = []
+        if max_qubits is not None and metrics["n_qubits"] > max_qubits:
+            violations.append(f"qubits {metrics['n_qubits']} > limit {max_qubits}")
+        if max_gates is not None and metrics["n_gates"] > max_gates:
+            violations.append(f"gates {metrics['n_gates']} > limit {max_gates}")
+        if max_depth is not None and metrics["depth"] > max_depth:
+            violations.append(f"depth {metrics['depth']} > limit {max_depth}")
+        if violations:
+            metrics["ok"] = False
+            metrics["resource_violation"] = violations
+            metrics["error"] = (
+                "NOT VIABLE -- circuit exceeds the resource budget: "
+                + "; ".join(violations)
+                + f". It scored accuracy={metrics['accuracy']:.3f}, but that "
+                "does NOT count while over budget and this circuit cannot be "
+                "submitted. Reduce qubits/gates/depth and try a smaller circuit.")
         return metrics
     except Exception as exc:  # returned to the agent for self-correction
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}

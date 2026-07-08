@@ -138,12 +138,19 @@ class PipelineState(TypedDict, total=False):
     #   {"score", "code", "trial", "metrics"} of the best trial of the WHOLE
     #   run, official or not. If it still beats the official best at deploy
     #   time, deploy re-evaluates it officially (salvage) before summarizing.
+    session_research: int
+    #   non-evaluate ("research") tool calls the designer has used this
+    #   session (docs / papers / seed library / notes). At
+    #   max_session_research further research calls are skipped with an
+    #   out-of-budget message; each executed call's result is annotated with
+    #   the remaining count. Reset by the evaluate node.
     gen_no_tool: int
-    #   consecutive generate replies that needed a corrective nudge: no trial
-    #   run yet, a new design presented without calling evaluate, or
-    #   code-like text with no parsable block (malformed tool call). At
-    #   max_gen_no_tool we stop nudging: submit the session's best if any
-    #   trial ran, otherwise deploy.
+    #   consecutive unproductive generate turns: a reply that needed a
+    #   corrective nudge (no trial run yet, new design presented without
+    #   calling evaluate, malformed tool call), or a tool batch in which
+    #   EVERY call was skipped (budgets exhausted). At max_gen_no_tool we
+    #   stop indulging it: submit the session's best if any trial ran,
+    #   otherwise deploy.
 
     # --- official results (ONLY the evaluate node writes these) ---------------
     iteration: int
@@ -155,7 +162,9 @@ class PipelineState(TypedDict, total=False):
     review: str
     #   the latest reviewer feedback (after deploy: the final summary).
     explore_rounds: int
-    #   explorer <-> explore_tools loop count (guard, max_explore_rounds).
+    #   count of explorer research rounds so far. Up to max_explore_rounds
+    #   rounds use research tools; then one extra turn writes final notes and
+    #   hands off (so the cap counts research rounds, not the notes turn).
 
 
 def _extract_code(text) -> str:
@@ -193,6 +202,7 @@ class AgentPipeline:
         generate_llm,
         *,
         use_explorer: bool = True,               # toggle the explorer subgraph
+        use_notes_tool: bool = False,            # give generate a re-read tool
         explorer_llm=None,
         review_llm=None,
         deploy_llm=None,
@@ -210,8 +220,9 @@ class AgentPipeline:
         evaluate_kwargs: Optional[dict] = None,
         max_explore_rounds: int = 4,
         max_gen_no_tool: int = 2,
-        max_tool_rounds: int = 3,
+        max_tool_rounds: int = 3,                # review: max tool CALLS per round
         max_session_trials: int = 3,             # trial evaluations per design session
+        max_session_research: int = 4,           # non-evaluate tool calls per session
     ):
         self.task = task
         self.evaluate_kwargs = evaluate_kwargs or {}
@@ -221,6 +232,10 @@ class AgentPipeline:
         self.deploy_llm = deploy_llm or generate_llm
         self.translate_llm = translate_llm
         self.use_explorer = use_explorer
+        # the notes tool only makes sense when the explorer runs; it is also
+        # redundant with the notes already in generate's system prompt, so it
+        # is opt-in (default off to save tool calls / context)
+        self.use_notes_tool = use_notes_tool and use_explorer
         self.explorer_tools = explorer_tools or []
         self.generate_tools = generate_tools or []
         self.review_tools = review_tools or []
@@ -240,10 +255,13 @@ class AgentPipeline:
         self.max_gen_no_tool = max_gen_no_tool
         self.max_tool_rounds = max_tool_rounds
         self.max_session_trials = max_session_trials
+        self.max_session_research = max_session_research
         # a persistent side-file where explorer notes + tool findings accumulate
         # (lives inside the task's per-run folder, next to the transcript)
         self.notes_path = os.path.join(task.run_dir, "notes.md")
-        # designer-side tool to re-read the notes file (only wired if explorer on)
+        # the explorer's final handoff notes; what check_explorer_notes returns
+        # (that tool is wired into generate only when use_notes_tool is on)
+        self._explorer_notes = ""
         self.check_notes_tool = self._make_check_notes_tool()
         # seed reference designs, exposed as a tool (explorer + generate)
         self.seed_library_tool = self._make_seed_library_tool()
@@ -328,23 +346,19 @@ class AgentPipeline:
         return evaluate
 
     def _make_check_notes_tool(self):
-        """Tool letting the designer re-read the explorer's notes file."""
-        notes_path = self.notes_path
+        """Tool letting the designer re-read the explorer's distilled notes."""
+        pipeline = self
 
         @tool
         def check_explorer_notes() -> str:
-            """Return the explorer's accumulated research notes for this run.
+            """Return the explorer's distilled research notes for this run.
 
             Call this to re-read the background research (documentation
-            findings, prior work, design advice) gathered before -- and
-            during -- the design phase.
+            findings, prior work, design advice) the explorer summarized
+            before the design phase.
             """
-            try:
-                with open(notes_path, "r", encoding="utf-8") as f:
-                    text = f.read().strip()
-            except FileNotFoundError:
-                text = ""
-            return text or "(no explorer notes recorded yet)"
+            return (pipeline._explorer_notes.strip()
+                    or "(no explorer notes recorded yet)")
 
         return check_explorer_notes
 
@@ -387,10 +401,10 @@ class AgentPipeline:
 
     def _design_tools(self) -> list:
         """Everything the generate LLM can call: research tools, the seed
-        library, the notes tool (iff the explorer is in the graph), and ALWAYS
-        the evaluate tool."""
+        library, the notes tool (only if use_notes_tool), and ALWAYS the
+        evaluate tool."""
         tools = list(self.generate_tools) + [self.seed_library_tool]
-        if self.use_explorer:
+        if self.use_notes_tool:
             tools.append(self.check_notes_tool)
         tools.append(self.evaluate_tool)
         return self._dedupe_tools(tools)
@@ -468,14 +482,19 @@ class AgentPipeline:
 
         Every tool result is appended to the conversation BEFORE the next
         invoke, so the final plain-text reply is produced with all of them in
-        context -- nothing gathered along the way is hidden from it. If the
-        round budget runs out while the model is still calling tools, it is
+        context -- nothing gathered along the way is hidden from it. At most
+        max_tool_rounds tool CALLS are executed in total per review round
+        (calls_used is a local: this whole loop runs once per official
+        variant, so the budget resets naturally each round); calls beyond the
+        budget are answered with an out-of-budget message instead of running.
+        If the model is still calling tools when the rounds run out, it is
         explicitly asked to stop and summarize, so the final answer never
         comes back as an empty tool-call stub."""
         bound = llm.bind_tools(tools) if tools else llm
         tool_map = {t.name: t for t in tools}
         convo = list(messages)
         dt = 0.0
+        calls_used = 0
         for _ in range(self.max_tool_rounds):
             t0 = time.perf_counter()
             resp = bound.invoke(convo)
@@ -489,7 +508,16 @@ class AgentPipeline:
             self.task.log("TOOL REQUEST (review)",
                           (_text_of(resp).strip() + "\n-> " + asks).strip())
             for call in resp.tool_calls:
+                if calls_used >= self.max_tool_rounds:
+                    skip = (f"tool budget ({self.max_tool_rounds} calls) "
+                            "exhausted; give your final answer now")
+                    self.task.log(f"TOOL {call['name']} (skipped)", skip)
+                    convo.append(ToolMessage(
+                        content=json.dumps({"ok": False, "skipped": skip}),
+                        tool_call_id=call["id"], name=call["name"]))
+                    continue
                 msg, _ = self._invoke_tool(tool_map, call)
+                calls_used += 1
                 convo.append(msg)
         # budget exhausted while still calling tools: demand a final summary
         # so everything learned from the tool calls makes it into the answer
@@ -531,10 +559,15 @@ class AgentPipeline:
 
         out: dict = {"explore_messages": [resp], "explore_rounds": rounds,
                      "notes": notes}
-        # hand off exactly when we will NOT keep researching
-        handing_off = (not _has_tool_calls(resp)) or (rounds >= self.max_explore_rounds)
+        # hand off when the explorer stops researching on its own, OR after it
+        # has used all max_explore_rounds research rounds AND been given one
+        # extra turn to write notes (that notes turn is round max+1).
+        handing_off = (not _has_tool_calls(resp)) or (rounds > self.max_explore_rounds)
         if handing_off:
             out["notes"] = notes or "(no notes produced)"
+            # what the designer re-reads via check_explorer_notes (clean notes,
+            # not the raw per-tool findings that also land in notes.md)
+            self._explorer_notes = out["notes"]
             self.task.log(f"EXPLORE handoff [llm {dt:.2f}s]", out["notes"])
         else:
             self.task.log(f"EXPLORE (round {rounds}) [llm {dt:.2f}s]", text)
@@ -543,18 +576,17 @@ class AgentPipeline:
     def explore_tools_node(self, state: PipelineState) -> dict:
         """Tool executor for the explorer's channel (research calls only).
 
-        Runs BETWEEN explorer turns, so after turn max_explore_rounds - 1 it
-        appends a wrap-up warning: the NEXT explorer turn is the last one
-        (the handoff is forced at max_explore_rounds and pending tool calls
-        would be dropped), so the explorer should spend it writing its final
-        notes instead of being cut off mid-research."""
+        Runs BETWEEN explorer turns. Once all max_explore_rounds research
+        rounds are used, it appends a wrap-up warning so the explorer spends
+        its one extra (notes) turn writing final notes rather than making tool
+        calls that would be dropped when the handoff is forced."""
         last = state["explore_messages"][-1]
         tool_map = {t.name: t for t in self._explorer_toolset()}
         out = [self._invoke_tool(tool_map, call, note=True)[0]
                for call in last.tool_calls]
-        if state.get("explore_rounds", 0) >= self.max_explore_rounds - 1:
-            warning = ("This is your FINAL research round. Do NOT call any "
-                       "more tools -- reply with your complete, actionable "
+        if state.get("explore_rounds", 0) >= self.max_explore_rounds:
+            warning = ("You have used all your research rounds. Do NOT call "
+                       "any more tools -- reply with your complete, actionable "
                        "notes summary for the designer.")
             self.task.log("WARNING (explorer)", warning)
             out.append(HumanMessage(content=warning))
@@ -569,10 +601,25 @@ class AgentPipeline:
         sys_content = self.task.system_prompt("generate")
         notes = (state.get("notes") or "").strip()
         if notes:
+            sys_content += "\n\n# Research notes from the explorer\n" + notes
+            if self.use_notes_tool:
+                sys_content += ("\n\n(You can re-read these notes anytime with "
+                                "`check_explorer_notes`.)")
+        # From session 2 on, remind the designer that the best-so-far is already
+        # BANKED by the system (it is what the final report uses) -- so it must
+        # try to BEAT it with a new design, never waste a session resubmitting
+        # it. This is the fix for "generate keeps re-returning a prior session's
+        # best": re-submitting adds nothing, the system already kept that design.
+        best = state.get("best") or {}
+        if best.get("code"):
             sys_content += (
-                "\n\n# Research notes from the explorer\n" + notes +
-                "\n\n(Raw tool findings behind these notes: call "
-                "`check_explorer_notes`.)")
+                f"\n\n# Best design so far: variant #{best.get('variant', '?')} "
+                f"({self.target_metric}={best.get(self.target_metric)})\n"
+                "The system has ALREADY saved this and will report it if nothing "
+                "beats it -- you NEVER need to resubmit it. Each session, spend "
+                "your trials trying to EXCEED it with a genuinely DIFFERENT "
+                "design; resubmitting the current best (or a cosmetic tweak) "
+                "wastes the session and is not progress.")
         self._log_system("generate", sys_content)
         bound = self.generate_llm.bind_tools(self._design_tools())
         t0 = time.perf_counter()
@@ -583,7 +630,8 @@ class AgentPipeline:
                       _text_of(resp))
         out: dict = {"messages": [resp]}
         if _has_tool_calls(resp):
-            out["gen_no_tool"] = 0
+            # gen_tools decides whether this batch is productive (it may skip
+            # every call on exhausted budgets), so it owns the strike counter
             return out
 
         # Plain reply: either a real submission, or a slip that needs a
@@ -652,13 +700,36 @@ class AgentPipeline:
         tool_map = {t.name: t for t in self._design_tools()}
         trials = state.get("session_trials", 0)
         n_before = trials
+        research = state.get("session_research", 0)
+        research_before = research
         sess_best = dict(state.get("session_best") or {})
         run_best = dict(state.get("best_trial") or {})
         out_messages = []
         failed = False
+        executed_any = False
         for call in last.tool_calls:
             if call["name"] != self.evaluate_tool_name:
-                out_messages.append(self._invoke_tool(tool_map, call)[0])
+                # research call (docs / papers / seeds / notes): budgeted per
+                # session, and every result tells the model what's left
+                if research >= self.max_session_research:
+                    skip_reason = (
+                        f"research budget ({self.max_session_research} "
+                        "non-evaluate calls per session) exhausted; run a "
+                        f"trial with `{self.evaluate_tool_name}` or reply "
+                        "without tools to submit")
+                    self.task.log(f"TOOL {call['name']} (skipped)", skip_reason)
+                    out_messages.append(ToolMessage(
+                        content=json.dumps({"ok": False, "skipped": skip_reason}),
+                        tool_call_id=call["id"], name=call["name"]))
+                else:
+                    msg, _ = self._invoke_tool(tool_map, call)
+                    research += 1
+                    executed_any = True
+                    left = self.max_session_research - research
+                    out_messages.append(ToolMessage(
+                        content=(f"{msg.content}\n[research calls left this "
+                                 f"session: {left}]"),
+                        tool_call_id=call["id"], name=call["name"]))
                 continue
             if failed:
                 skip_reason = ("an earlier trial in this batch failed; "
@@ -671,6 +742,7 @@ class AgentPipeline:
                 msg, parsed = self._invoke_tool(tool_map, call)
                 out_messages.append(msg)
                 trials += 1
+                executed_any = True
                 metrics = parsed if isinstance(parsed, dict) else {}
                 code = call["args"].get("code", "")
                 if metrics.get("ok"):
@@ -700,7 +772,13 @@ class AgentPipeline:
                    f"(trial {sess_best.get('trial')}) is submitted.")
             self.task.log("WARNING (generate)", ask)
             out_messages.append(HumanMessage(content=ask))
-        # make the routing visible in the transcript
+        # make the routing visible in the transcript (mirrors trial logging)
+        if research > research_before:
+            dest = ("research budget spent -> run a trial or submit"
+                    if research >= self.max_session_research
+                    else "back to generate for more research or a trial")
+            self.task.log(
+                f"SESSION research {research}/{self.max_session_research}", dest)
         if trials > n_before:
             dest = ("budget spent -> designer asked for its final design"
                     if trials >= self.max_session_trials
@@ -708,7 +786,12 @@ class AgentPipeline:
             self.task.log(f"SESSION trials {trials}/{self.max_session_trials}",
                           dest)
         out: dict = {"messages": out_messages, "session_trials": trials,
+                     "session_research": research,
                      "session_best": sess_best, "best_trial": run_best,
+                     # a batch where EVERY call was skipped is an unproductive
+                     # turn; a productive one clears the strike counter
+                     "gen_no_tool": (0 if executed_any
+                                     else state.get("gen_no_tool", 0) + 1),
                      # asked to submit but evaluated again anyway -> force it
                      "force_official": bool(
                          n_before >= self.max_session_trials
@@ -780,7 +863,8 @@ class AgentPipeline:
         return {"last_metrics": {**metrics, "variant": variant_num,
                                  "submitted": submitted},
                 "best": best, "iteration": variant_num,
-                "session_trials": 0,      # fresh budget for the next session
+                "session_trials": 0,      # fresh budgets for the next session
+                "session_research": 0,
                 "session_best": {},       # next session tracks its own best
                 "force_official": False,  # ask-then-force cycle starts over
                 "gen_no_tool": 0,         # a submission is not a refusal
@@ -903,7 +987,10 @@ class AgentPipeline:
 
     def _route_after_explorer(self, state: PipelineState) -> str:
         last = state["explore_messages"][-1]
-        if _has_tool_calls(last) and state.get("explore_rounds", 0) < self.max_explore_rounds:
+        # <= max (not <): after the max-th research round we still enter
+        # explore_tools once more to run its tools and append the wrap-up
+        # warning; the (max+1)-th explorer turn then writes notes and hands off
+        if _has_tool_calls(last) and state.get("explore_rounds", 0) <= self.max_explore_rounds:
             return "explore_tools"
         return "generate"          # done researching -> design
 
@@ -928,6 +1015,10 @@ class AgentPipeline:
         # forced on a designer that keeps calling evaluate after being asked.
         if state.get("force_official"):
             return "evaluate"
+        if state.get("gen_no_tool", 0) >= self.max_gen_no_tool:
+            # repeated fully-skipped batches (exhausted budgets): stop looping
+            return ("evaluate" if state.get("session_trials", 0) > 0
+                    else "deploy")
         return "generate"
 
     def _route_after_evaluate(self, state: PipelineState) -> str:
@@ -962,7 +1053,8 @@ class AgentPipeline:
                                 {"gen_tools": "gen_tools", "evaluate": "evaluate",
                                  "generate": "generate", "deploy": "deploy"})
         g.add_conditional_edges("gen_tools", self._route_after_gen_tools,
-                                {"evaluate": "evaluate", "generate": "generate"})
+                                {"evaluate": "evaluate", "generate": "generate",
+                                 "deploy": "deploy"})
         g.add_conditional_edges("evaluate", self._route_after_evaluate,
                                 {"review": "review", "deploy": "deploy"})
         g.add_conditional_edges("review", self._route_after_review,
@@ -1030,7 +1122,8 @@ class AgentPipeline:
 
         init_state: dict = {"messages": [design_first], "review_messages": [],
                             "notes": "", "iteration": 0, "best": {},
-                            "session_trials": 0, "session_best": {},
+                            "session_trials": 0, "session_research": 0,
+                            "session_best": {},
                             "best_trial": {}, "force_official": False,
                             "gen_no_tool": 0}
         if self.use_explorer:
@@ -1042,13 +1135,18 @@ class AgentPipeline:
         self.task.log("RUN CONFIG",
                       f"{self.task.describe()}\n"
                       f"explorer={'ON' if self.use_explorer else 'OFF'} "
+                      f"notes_tool={'ON' if self.use_notes_tool else 'OFF'} "
                       f"explorer_tools={[t.name for t in self._explorer_toolset()]}\n"
                       f"design_tools={[t.name for t in self._design_tools()]} "
                       f"review_tools={[t.name for t in self.review_tools]}\n"
                       f"max_iters={self.max_iters} (official variants) "
                       f"target={self.target_metric}>={self.target_value} "
+                      f"entry_point={self.entry_point}\n"
                       f"max_session_trials={self.max_session_trials} "
-                      f"entry_point={self.entry_point}")
+                      f"max_session_research={self.max_session_research} "
+                      f"max_explore_rounds={self.max_explore_rounds} "
+                      f"max_gen_no_tool={self.max_gen_no_tool} "
+                      f"max_tool_rounds={self.max_tool_rounds} (review tool calls)")
         run_t0 = time.perf_counter()
         app = self.build_graph()
         final = app.invoke(init_state, {"recursion_limit": 100})
