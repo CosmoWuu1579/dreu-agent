@@ -223,7 +223,8 @@ class AgentPipeline:
         evaluate_kwargs: Optional[dict] = None,
         max_explore_rounds: int = 4,
         max_gen_no_tool: int = 2,
-        max_tool_rounds: int = 3,                # review: max tool CALLS per round
+        max_tool_rounds: int = 3,                # review: max ai->tool->ai TURNS per round
+        max_tool_calls: int = 4,                 # review: max executed tool CALLS per round
         max_session_trials: int = 3,             # trial evaluations per design session
         max_session_research: int = 4,           # non-evaluate tool calls per session
     ):
@@ -259,6 +260,7 @@ class AgentPipeline:
         self.max_explore_rounds = max_explore_rounds
         self.max_gen_no_tool = max_gen_no_tool
         self.max_tool_rounds = max_tool_rounds
+        self.max_tool_calls = max_tool_calls
         self.max_session_trials = max_session_trials
         self.max_session_research = max_session_research
         # a persistent side-file where explorer notes + tool findings accumulate
@@ -487,8 +489,9 @@ class AgentPipeline:
 
         Every tool result is appended to the conversation BEFORE the next
         invoke, so the final plain-text reply is produced with all of them in
-        context -- nothing gathered along the way is hidden from it. At most
-        max_tool_rounds tool CALLS are executed in total per review round
+        context -- nothing gathered along the way is hidden from it. Two
+        independent budgets: at most max_tool_rounds ai->tool->ai TURNS, and
+        at most max_tool_calls tool CALLS executed in total across them
         (calls_used is a local: this whole loop runs once per official
         variant, so the budget resets naturally each round); calls beyond the
         budget are answered with an out-of-budget message instead of running.
@@ -513,8 +516,8 @@ class AgentPipeline:
             self.task.log("TOOL REQUEST (review)",
                           (_text_of(resp).strip() + "\n-> " + asks).strip())
             for call in resp.tool_calls:
-                if calls_used >= self.max_tool_rounds:
-                    skip = (f"tool budget ({self.max_tool_rounds} calls) "
+                if calls_used >= self.max_tool_calls:
+                    skip = (f"tool budget ({self.max_tool_calls} calls) "
                             "exhausted; give your final answer now")
                     self.task.log(f"TOOL {call['name']} (skipped)", skip)
                     convo.append(ToolMessage(
@@ -895,9 +898,17 @@ class AgentPipeline:
         # the seed library rides in the SYSTEM message: the reviewer sees it on
         # every call, but it is never appended to the accumulating review
         # thread, so it is not duplicated round after round.
-        review_system = (self.task.system_prompt("review")
-                         + "\n\n# Seed library (known-good reference designs)\n"
-                         + self._seed_block())
+        review_system = self.task.system_prompt("review")
+        if self.review_tools:
+            # the budget is a TOTAL cap, so batching several calls in one turn
+            # wastes the chance to react to each result -- say so up front
+            review_system += (
+                f"\n\nTool budget: at most {self.max_tool_calls} tool calls "
+                f"TOTAL across {self.max_tool_rounds} turns per review. Spend "
+                "them ONE AT A TIME so each call can react to the previous "
+                "result; try not to batch several calls in one turn.")
+        review_system += ("\n\n# Seed library (known-good reference designs)\n"
+                          + self._seed_block())
         self._log_system("review", review_system)
         resp, _, dt = self._run_with_tools(
             self.review_llm, self.review_tools,
@@ -1188,7 +1199,8 @@ class AgentPipeline:
                       f"max_session_research={self.max_session_research} "
                       f"max_explore_rounds={self.max_explore_rounds} "
                       f"max_gen_no_tool={self.max_gen_no_tool} "
-                      f"max_tool_rounds={self.max_tool_rounds} (review tool calls)")
+                      f"max_tool_rounds={self.max_tool_rounds} (review turns) "
+                      f"max_tool_calls={self.max_tool_calls} (review tool calls)")
         run_t0 = time.perf_counter()
         app = self.build_graph()
         final = app.invoke(init_state, {"recursion_limit": 100})

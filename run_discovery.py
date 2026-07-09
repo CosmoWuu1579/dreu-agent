@@ -37,7 +37,8 @@ from qml_task import (make_qml_task, classical_baselines, format_classical_repor
 # RAG / web-search / docs tools (db/agent.py): rag_search hits the local PDF
 # knowledge base (Chroma + OpenAI embeddings), web_search is Tavily, qiskit_docs
 # is the offline Qiskit API reference. Import is cheap (retrievers are lazy).
-from db.agent import rag_search, web_search, qiskit_docs
+from db.agent import (rag_search, web_search, qiskit_docs,
+                      search_and_summarize_papers)
 
 # AGENT_MODEL is provider-agnostic (init_chat_model). ANTHROPIC_MODEL kept as a
 # fallback for backward compatibility with older .env files.
@@ -80,6 +81,29 @@ def build_pipeline() -> AgentPipeline:
         expert = make_llm(temperature=0.5, max_tokens=512, model=REVIEW_MODEL)
         msg = expert.invoke(
             f"You are a QML expert. In 2 sentences, advise on: {topic}")
+        return msg.content if isinstance(msg.content, str) else str(msg.content)
+
+    # ---- grounded expert: the QUESTION is the retrieval query (astronaut
+    # pattern) -- papers are fetched from the knowledge base, summarized with
+    # respect to the question, and the expert must answer from them ----
+    @tool
+    def expert_consult_grounded(question: str) -> str:
+        """Ask a QML domain expert a specific question. The question itself is
+        used to search the internal paper knowledge base; the expert answers
+        grounded in what those papers say (and tells you when they don't cover
+        it). Prefer this over ungrounded advice whenever prior work might
+        answer the question -- phrase it as a full, specific question."""
+        references = search_and_summarize_papers(question)
+        expert = make_llm(temperature=0.3, max_tokens=1024, model=REVIEW_MODEL)
+        msg = expert.invoke(
+            "You are a quantum machine learning expert specializing in "
+            "quantum feature map design.\n"
+            "Answer the question below using the reference information as "
+            "your primary source, supplemented by your expertise. Be specific "
+            "and actionable. If the references do not cover the question, "
+            "say so explicitly before answering from general knowledge.\n\n"
+            f"## Question\n{question}\n\n"
+            f"## Reference information (paper summaries)\n{references}")
         return msg.content if isinstance(msg.content, str) else str(msg.content)
 
     # Per-node toolsets (AgentPipeline also auto-adds view_seed_library to the

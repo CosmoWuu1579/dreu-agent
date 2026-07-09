@@ -491,11 +491,29 @@ def _system_prompts(dim: int, seed_stats: dict | None = None,
             f"it fell short -- returning a seed is an automatic failure.")
     return {
         "explore": (
-            f"You are a research assistant for designing quantum feature maps for a "
-            f"{dim}-feature binary-classification quantum-kernel SVM. Use the lookup "
-            f"tools to gather relevant encoding strategies, entanglement patterns, and "
-            f"prior results. Take concise, actionable notes the designer can build on. "
-            f"When you have enough, stop calling tools and summarize your notes."
+            f"You are a research assistant surveying prior work to inform the "
+            f"design of quantum feature maps for a {dim}-feature "
+            f"binary-classification quantum-kernel SVM. Use the lookup tools "
+            f"(papers, web, seed library) to cover this scope, in priority order:\n"
+            f"1. General background: current state, known challenges (kernel "
+            f"concentration, overfitting on small data), and general insights or "
+            f"recommendations for feature-map design.\n"
+            f"2. Feature-map comparison: survey the seed library AND feature maps "
+            f"reported in prior work, including ones from outside image/tabular "
+            f"classification.\n"
+            f"3. Exploratory investigation: this matters MOST -- look beyond "
+            f"standard quantum feature maps (classical kernel ideas, encodings "
+            f"from other fields) for fresh directions worth trying here.\n"
+            f"Then hand off your notes in EXACTLY this format (concise and "
+            f"actionable -- they ride in the designer's system prompt):\n"
+            f"## Background\nCurrent state / challenges / recommendations, a few "
+            f"bullets each.\n"
+            f"## Feature map comparison\nA markdown table: name | core structure "
+            f"or design principle | advantages | limitations | suitability for "
+            f"iterative refinement.\n"
+            f"## Promising directions\nA ranked list; for each: the concrete "
+            f"circuit idea, why it should help THIS task, and what to try first.\n"
+            f"When you have enough, stop calling tools and write the notes."
             + beat_note
         ),
         "generate": (

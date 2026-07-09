@@ -101,6 +101,88 @@ def rag_search(query: str) -> str:
     )
 
 
+# --------------------------------------------------------------------------- #
+# Document-level RAG with a summarizer (the astronaut pattern): the chunk hit
+# only says WHICH paper is relevant; the FULL paper is then loaded from disk
+# and distilled by a cheap LLM into a query-focused summary. The agent never
+# sees raw 1000-char fragments -- it sees a digest of the whole document.
+# --------------------------------------------------------------------------- #
+RAG_SUMMARY_MODEL = os.getenv("RAG_SUMMARY_MODEL", "openai:gpt-4o-mini")
+MAX_DOC_CHARS = 60_000        # cap on full-paper text fed to the summarizer
+MAX_SUMMARY_WORDS = 300
+
+
+@lru_cache(maxsize=1)
+def get_summary_llm():
+    return init_chat_model(RAG_SUMMARY_MODEL, temperature=0)
+
+
+def _resolve_pdf_path(source: str) -> str | None:
+    """Chunk metadata stores the path ingest.py was given (e.g. 'pdfs/x.pdf',
+    relative to this folder). Return an existing absolute path or None."""
+    if not source:
+        return None
+    if os.path.isabs(source) and os.path.exists(source):
+        return source
+    candidate = os.path.join(HERE, source)
+    return candidate if os.path.exists(candidate) else None
+
+
+def _load_pdf_text(path: str) -> str:
+    import fitz  # PyMuPDF (already required by the ingest loader)
+    with fitz.open(path) as pdf:
+        return "\n".join(page.get_text() for page in pdf)
+
+
+def search_and_summarize_papers(query: str, max_docs: int = 3) -> str:
+    """Retrieve chunks for `query`, map them back to their source PDFs
+    (deduped, at most `max_docs` papers), load each FULL paper, and have a
+    cheap LLM summarize it with respect to the query. Plain function so other
+    code (e.g. a grounded expert) can reuse it without the tool wrapper."""
+    docs = get_retriever().invoke(query)
+    summarizer = get_summary_llm()
+    seen: set = set()
+    blocks = []
+    for d in docs:
+        src = d.metadata.get("source")
+        if src in seen:
+            continue
+        seen.add(src)
+        if len(blocks) >= max_docs:
+            break
+        path = _resolve_pdf_path(src)
+        try:
+            text = _load_pdf_text(path)[:MAX_DOC_CHARS] if path else d.page_content
+        except Exception:
+            text = d.page_content  # PDF unreadable -> at least the chunk
+        try:
+            msg = summarizer.invoke(
+                f"Summarize the following paper in at most {MAX_SUMMARY_WORDS} "
+                f"words, focusing ONLY on what is relevant to this query:\n"
+                f"{query}\n\n"
+                "Include concrete techniques, circuit structures, parameter "
+                "choices, and reported results. If the paper is irrelevant to "
+                "the query, say so in one line instead.\n\n"
+                f"## Paper ({src})\n{text}")
+            summary = msg.content if isinstance(msg.content, str) else str(msg.content)
+        except Exception as exc:
+            summary = f"(summarizer failed: {exc})\n{d.page_content}"
+        blocks.append(f"[{src}]\n{summary.strip()}")
+    if not blocks:
+        return f"No knowledge-base matches for: {query!r}"
+    return "\n\n---\n\n".join(blocks)
+
+
+@tool
+def rag_search_summarized(query: str) -> str:
+    """Search the internal PDF knowledge base. Each matching PAPER is read in
+    full and summarized with respect to your query by a helper model, so you
+    get whole-paper insight (methods, circuits, results) instead of short
+    excerpts. Slower than rag_search but much higher signal; make the query
+    specific about what you want to learn."""
+    return search_and_summarize_papers(query)
+
+
 @tool
 def web_search(query: str, max_searches: int = 5) -> str:
     """Search the web for current or external information."""
