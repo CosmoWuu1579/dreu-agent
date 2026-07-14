@@ -10,6 +10,23 @@ scikit-learn==1.9.0
 numpy==2.4.2
 matplotlib==3.11.0
 
+# Deep learning: the hybrid quantum-classical head (TorchConnector) for the
+# stronglyentangled/ task, mirroring the paper's source. Pick a build compatible
+# with your Python (torch >= 2.5 supports 3.13); torchvision is only needed to
+# load real Br35H MRI images (not for the ad_hoc stand-in features).
+#
+# GPU (CUDA) BUILD -- IMPORTANT for running the full evaluator / CNN-*.py on a
+# GPU node. The plain `pip install torch` gives a CPU-ONLY wheel on Windows/macOS
+# (and your local env is torch 2.x+cpu, which ignores GPUs entirely). To get a
+# CUDA build, UNCOMMENT the --extra-index-url line below, choosing the tag that
+# matches the node's driver (`nvidia-smi` shows the CUDA version): cu121, cu124,
+# cu128, ... Then `pip install -r requirements.txt`. Verify with:
+#     python -c "import torch; print(torch.cuda.is_available())"   # must be True
+# --extra-index-url https://download.pytorch.org/whl/cu124
+torch>=2.5
+torchvision>=0.20
+pillow>=10.0                # PIL.Image: MRI loading in the paper's CNN-*.py + the full evaluator
+
 # LangGraph agent
 langgraph==1.2.7
 langchain==1.3.11          # provides init_chat_model (provider-agnostic model factory)

@@ -38,7 +38,7 @@ from qml_task import (make_qml_task, classical_baselines, format_classical_repor
 # knowledge base (Chroma + OpenAI embeddings), web_search is Tavily, qiskit_docs
 # is the offline Qiskit API reference. Import is cheap (retrievers are lazy).
 from db.agent import (rag_search, web_search, qiskit_docs,
-                      search_and_summarize_papers)
+                      rag_search_summarized, search_and_summarize_papers)
 
 # AGENT_MODEL is provider-agnostic (init_chat_model). ANTHROPIC_MODEL kept as a
 # fallback for backward compatibility with older .env files.
@@ -109,12 +109,13 @@ def build_pipeline() -> AgentPipeline:
     # Per-node toolsets (AgentPipeline also auto-adds view_seed_library to the
     # explorer + generate, check_explorer_notes to generate, and the evaluate
     # tool to generate):
-    #   explorer : web_search + rag_search  (gather external + internal research)
-    #   generate : rag_search + qiskit_docs (knowledge base + API reference)
-    #   review   : rag_search + expert_consult
-    explorer_tools = [web_search, rag_search]
-    generate_tools = [rag_search, qiskit_docs]
-    review_tools = [rag_search, ]
+    #   explorer : web_search + rag_search_summarized (external research +
+    #              whole-paper digests from the knowledge base)
+    #   generate : rag_search_summarized + qiskit_docs (knowledge base + API)
+    #   review   : rag_search (cheap chunk lookup) + expert_consult_grounded
+    explorer_tools = [web_search, rag_search_summarized]
+    generate_tools = [rag_search_summarized, qiskit_docs]
+    review_tools = [rag_search, expert_consult_grounded]
 
     generate_llm = make_llm(temperature=TEMPERATURE, max_tokens=4096)  # AGENT_MODEL
     explorer_llm = make_llm(temperature=0.5, max_tokens=2048, model=EXPLORER_MODEL)

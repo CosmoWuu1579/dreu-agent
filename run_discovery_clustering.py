@@ -40,7 +40,8 @@ from clustering_task import (make_clustering_task, classical_baselines,
 # RAG / web-search / docs tools (db/agent.py): rag_search hits the local PDF
 # knowledge base (Chroma + OpenAI embeddings), web_search is Tavily, qiskit_docs
 # is the offline Qiskit API reference. Import is cheap (retrievers are lazy).
-from db.agent import rag_search, web_search, qiskit_docs
+from db.agent import (rag_search, web_search, qiskit_docs,
+                      rag_search_summarized, search_and_summarize_papers)
 
 MODEL = os.environ.get("AGENT_MODEL") or os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8")
 PROVIDER = os.environ.get("AGENT_MODEL_PROVIDER") or None
@@ -81,15 +82,40 @@ def build_pipeline() -> AgentPipeline:
             f"(DQC1, Renyi-2). In 2 sentences, advise on: {topic}")
         return msg.content if isinstance(msg.content, str) else str(msg.content)
 
+    # ---- grounded expert: the QUESTION is the retrieval query (astronaut
+    # pattern) -- papers are fetched from the knowledge base, summarized with
+    # respect to the question, and the expert must answer from them ----
+    @tool
+    def expert_consult_grounded(question: str) -> str:
+        """Ask a domain expert a specific question. The question itself is
+        used to search the internal paper knowledge base; the expert answers
+        grounded in what those papers say (and tells you when they don't cover
+        it). Prefer this over ungrounded advice whenever prior work might
+        answer the question -- phrase it as a full, specific question."""
+        references = search_and_summarize_papers(question)
+        expert = make_llm(temperature=0.3, max_tokens=1024, model=REVIEW_MODEL)
+        msg = expert.invoke(
+            "You are an expert in quantum kernels and entropy-based "
+            "clustering (DQC1, Renyi-2), specializing in quantum feature map "
+            "design for trace kernels.\n"
+            "Answer the question below using the reference information as "
+            "your primary source, supplemented by your expertise. Be specific "
+            "and actionable. If the references do not cover the question, "
+            "say so explicitly before answering from general knowledge.\n\n"
+            f"## Question\n{question}\n\n"
+            f"## Reference information (paper summaries)\n{references}")
+        return msg.content if isinstance(msg.content, str) else str(msg.content)
+
     # Per-node toolsets (AgentPipeline also auto-adds view_seed_library to the
     # explorer + generate, check_explorer_notes to generate, and the evaluate
     # tool to generate):
-    #   explorer : web_search + rag_search  (gather external + internal research)
-    #   generate : rag_search + qiskit_docs (knowledge base + API reference)
-    #   review   : rag_search + expert_consult
-    explorer_tools = [web_search, rag_search]
-    generate_tools = [rag_search, qiskit_docs]
-    review_tools = [rag_search, ]
+    #   explorer : web_search + rag_search_summarized (external research +
+    #              whole-paper digests from the knowledge base)
+    #   generate : rag_search_summarized + qiskit_docs (knowledge base + API)
+    #   review   : rag_search (cheap chunk lookup) + expert_consult_grounded
+    explorer_tools = [web_search, rag_search_summarized]
+    generate_tools = [rag_search_summarized, qiskit_docs]
+    review_tools = [rag_search, expert_consult_grounded]
 
     generate_llm = make_llm(temperature=TEMPERATURE, max_tokens=4096)  # AGENT_MODEL
     explorer_llm = make_llm(temperature=0.5, max_tokens=2048, model=EXPLORER_MODEL)

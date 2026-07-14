@@ -84,118 +84,23 @@ tool call likewise ([tool X.XXs]).
 from __future__ import annotations
 
 import os
-import re
 import json
 import time
-from typing import Annotated, Optional, TypedDict
+from typing import Optional
 
 from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
 from langchain_core.messages import (AIMessage, HumanMessage, SystemMessage,
                                      ToolMessage)
-from langchain_core.tools import tool
 
 from DiscoveryTask import DiscoveryTask
-
-
-class PipelineState(TypedDict, total=False):
-    # --- message channels, one per agent (never mixed) -----------------------
-    messages: Annotated[list, add_messages]
-    #   the DESIGN thread: generate's conversation -- its tool calls, the tool
-    #   results, official-evaluation notices, and reviewer feedback.
-    explore_messages: Annotated[list, add_messages]
-    #   the explorer's private research thread (tool calls + results). Never
-    #   seen by the designer; only `notes` crosses over.
-    review_messages: Annotated[list, add_messages]
-    #   the reviewer's private thread: one (prompt, answer) pair per round, so
-    #   it remembers what it already advised. Tool plumbing is not persisted.
-
-    # --- explorer output ------------------------------------------------------
-    notes: str
-    #   the explorer's accumulated written notes (every round). Injected into
-    #   generate's SYSTEM prompt on every call. Raw tool dumps stay in the
-    #   notes file (readable via the check_explorer_notes tool).
-
-    # --- design-session bookkeeping (reset by the evaluate node) --------------
-    session_trials: int
-    #   how many trial evaluations the designer has used in the CURRENT
-    #   session. Routing reads this: >0 + plain reply -> submit to the
-    #   evaluate node. At >= max_session_trials the designer is ASKED to
-    #   present its final design (one analysis turn); only if it then calls
-    #   evaluate again is submission forced (see force_official). Reset to 0
-    #   after each official evaluation.
-    current_code: str
-    #   the design currently on the table: the BEST-scoring trial of this
-    #   session, overridden by the code block in generate's reply if it
-    #   contains one. THIS is what the evaluate node officially scores.
-    session_best: dict
-    #   {"score", "code", "trial"} of this session's best trial (drives
-    #   current_code); on equal scores the LATER trial wins. Also the FALLBACK
-    #   submission if the designer's chosen code errors in official
-    #   evaluation. Reset by the evaluate node.
-    force_official: bool
-    #   set when the designer was asked to submit (budget spent) but called
-    #   evaluate again anyway -- the router then forces official evaluation.
-    #   Reset by the evaluate node.
-    best_trial: dict
-    #   {"score", "code", "trial", "metrics"} of the best trial of the WHOLE
-    #   run, official or not. If it still beats the official best at deploy
-    #   time, deploy re-evaluates it officially (salvage) before summarizing.
-    session_research: int
-    #   non-evaluate ("research") tool calls the designer has used this
-    #   session (docs / papers / seed library / notes). At
-    #   max_session_research further research calls are skipped with an
-    #   out-of-budget message; each executed call's result is annotated with
-    #   the remaining count. Reset by the evaluate node.
-    gen_no_tool: int
-    #   consecutive unproductive generate turns: a reply that needed a
-    #   corrective nudge (no trial run yet, new design presented without
-    #   calling evaluate, malformed tool call), or a tool batch in which
-    #   EVERY call was skipped (budgets exhausted). At max_gen_no_tool we
-    #   stop indulging it: submit the session's best if any trial ran,
-    #   otherwise deploy.
-
-    # --- official results (ONLY the evaluate node writes these) ---------------
-    iteration: int
-    #   official variants recorded so far. max_iters caps this, not trials.
-    last_metrics: dict
-    #   metrics of the most recent official variant (what review critiques).
-    best: dict
-    #   best official variant so far: {code, <target_metric>, metrics, variant}.
-    review: str
-    #   the latest reviewer feedback (after deploy: the final summary).
-    explore_rounds: int
-    #   count of explorer research rounds so far. Up to max_explore_rounds
-    #   rounds use research tools; then one extra turn writes final notes and
-    #   hands off (so the cap counts research rounds, not the notes turn).
-
-
-def _extract_code(text) -> str:
-    """Pull the LAST ```python fenced code block out of an LLM message
-    ("" if none).
-
-    Last, not first: a submission reply often recaps earlier attempts before
-    presenting the final design, and the final design comes last. No raw-text
-    fallback: prose must never be mistaken for a submission."""
-    if isinstance(text, list):  # structured content blocks (Anthropic, etc.)
-        text = "\n".join(b["text"] for b in text
-                         if isinstance(b, dict) and b.get("type") == "text")
-    blocks = re.findall(r"```(?:python)?\s*(.*?)```", text or "", re.DOTALL)
-    return blocks[-1].strip() if blocks else ""
-
-
-def _text_of(message) -> str:
-    c = message.content
-    if isinstance(c, str):
-        return c
-    if isinstance(c, list):
-        return "\n".join(b["text"] for b in c
-                         if isinstance(b, dict) and b.get("type") == "text")
-    return str(c)
-
-
-def _has_tool_calls(message) -> bool:
-    return bool(getattr(message, "tool_calls", None))
+from PipelineState import PipelineState
+from pipeline_helpers import (_extract_code, _text_of, _has_tool_calls,
+                              from_model as _from_model,
+                              make_evaluate_tool, make_check_notes_tool,
+                              make_seed_library_tool, seed_block,
+                              explorer_toolset, design_tools, invoke_tool,
+                              sys_prompt, log_system, append_note,
+                              done, best_so_far_note)
 
 
 class AgentPipeline:
@@ -249,7 +154,7 @@ class AgentPipeline:
         # review feedback, plot filenames, and the final report line up
         self._eval_count = 0
         # there is exactly ONE evaluate tool; it always exists (task fallback)
-        self.evaluate_tool = evaluate_tool or self._make_evaluate_tool()
+        self.evaluate_tool = evaluate_tool or make_evaluate_tool(self)
         self.evaluate_tool_name = self.evaluate_tool.name
         self.deploy_prompt = deploy_prompt
         self.max_iters = max_iters
@@ -269,218 +174,19 @@ class AgentPipeline:
         # the explorer's final handoff notes; what check_explorer_notes returns
         # (that tool is wired into generate only when use_notes_tool is on)
         self._explorer_notes = ""
-        self.check_notes_tool = self._make_check_notes_tool()
+        self.check_notes_tool = make_check_notes_tool(self)
         # seed reference designs, exposed as a tool (explorer + generate)
-        self.seed_library_tool = self._make_seed_library_tool()
+        self.seed_library_tool = make_seed_library_tool(self)
         # last system prompt logged per role, so the transcript records each
         # system prompt once on first use and again whenever it changes
         self._logged_systems: dict = {}
 
     # ---------------------------------------------------------------- factory
-    @classmethod
-    def from_model(
-        cls,
-        task: DiscoveryTask,
-        model: str,
-        *,
-        model_provider: Optional[str] = None,
-        generate_kwargs: Optional[dict] = None,
-        explorer_kwargs: Optional[dict] = None,
-        review_kwargs: Optional[dict] = None,
-        deploy_kwargs: Optional[dict] = None,
-        translate_kwargs: Optional[dict] = None,
-        **pipeline_kwargs,
-    ) -> "AgentPipeline":
-        """Build a pipeline from a single provider-agnostic model id.
-
-        `model`/`model_provider` are passed to LangChain's ``init_chat_model``, so
-        any supported provider works ("claude-*", "gpt-*", "gemini-*", ...). Each
-        node's LLM is created from the same id with its own sampling kwargs
-        (temperature, max_tokens, ...); pass ``review_kwargs=None`` etc. to reuse
-        the generate model for that role. Remaining kwargs go to ``__init__``.
-        """
-        from langchain.chat_models import init_chat_model
-
-        def _llm(kwargs: Optional[dict]):
-            if kwargs is None:
-                return None
-            return init_chat_model(model, model_provider=model_provider, **kwargs)
-
-        generate_llm = _llm(generate_kwargs or {"temperature": 0.4, "max_tokens": 4096})
-        return cls(
-            task,
-            generate_llm=generate_llm,
-            explorer_llm=_llm(explorer_kwargs),
-            review_llm=_llm(review_kwargs),
-            deploy_llm=_llm(deploy_kwargs),
-            translate_llm=_llm(translate_kwargs),
-            **pipeline_kwargs,
-        )
-
-    # ------------------------------------------------------------------ tools
-    def _make_evaluate_tool(self):
-        """Default evaluate tool: runs task.evaluate and returns metrics as JSON.
-
-        Every call is stamped with a global `trial` number (also forwarded as
-        `iteration=` to the evaluator, which e.g. tags plot filenames), so
-        every artifact of the run traces back to the trial that produced it."""
-        task = self.task
-        pipeline = self
-
-        @tool
-        def evaluate(code: str) -> str:
-            """Run one TRIAL evaluation of a candidate and return metrics as JSON.
-
-            `code` MUST be the full Python source that defines the entry-point
-            function. Call this one candidate at a time: each result comes back
-            to you, so analyze it before deciding your next trial. You have a
-            limited budget of trials per design session; when it is spent you
-            will be asked to analyze your results and present your final
-            design. You can also stop early: when you are happy with a design,
-            reply WITHOUT calling tools and it is submitted for official
-            evaluation. Returns a JSON object with an "ok" flag, a "trial"
-            number identifying this candidate, plus metrics, or an "error"
-            string.
-            """
-            pipeline._eval_count += 1
-            kwargs = dict(pipeline.evaluate_kwargs)
-            kwargs.setdefault("iteration", pipeline._eval_count)
-            result = task.evaluate(code, **kwargs)
-            if isinstance(result, dict):
-                result.setdefault("trial", pipeline._eval_count)
-            return json.dumps(result)
-
-        return evaluate
-
-    def _make_check_notes_tool(self):
-        """Tool letting the designer re-read the explorer's distilled notes."""
-        pipeline = self
-
-        @tool
-        def check_explorer_notes() -> str:
-            """Return the explorer's distilled research notes for this run.
-
-            Call this to re-read the background research (documentation
-            findings, prior work, design advice) the explorer summarized
-            before the design phase.
-            """
-            return (pipeline._explorer_notes.strip()
-                    or "(no explorer notes recorded yet)")
-
-        return check_explorer_notes
-
-    def _seed_block(self, seed_type: Optional[str] = None) -> str:
-        """The task's seed artifacts as markdown. With no seed_type, EVERY
-        group in the library is included, one section per type."""
-        types = [seed_type] if seed_type else (self.task.seed_types() or [None])
-        parts = []
-        for st in types:
-            group = self.task.seeds(st)
-            if not group:
-                continue
-            entries = "\n\n".join(f"### {n}\n```python\n{c.strip()}\n```"
-                                  for n, c in group.items())
-            parts.append(f"## Seed type: {st}\n{entries}" if st else entries)
-        return "\n\n".join(parts) or "(no seeds available)"
-
-    def _make_seed_library_tool(self):
-        """Tool exposing the task's seed designs (replaces pasting them inline)."""
-        pipeline = self
-
-        @tool
-        def view_seed_library(seed_type: str = "") -> str:
-            """Return the library of known-good seed designs for this task.
-
-            These are reference artifacts you may start from, adapt, or
-            combine. By default the ENTIRE library is returned, grouped by
-            seed type; pass `seed_type` to see just one group. Consult it
-            before proposing your first candidate and whenever you want a
-            proven pattern to build on.
-            """
-            return pipeline._seed_block(seed_type or None)
-
-        return view_seed_library
-
-    def _explorer_toolset(self) -> list:
-        """Everything the explorer can call: injected research tools (web /
-        docs / papers -- optional) plus the seed library."""
-        return self._dedupe_tools(self.explorer_tools + [self.seed_library_tool])
-
-    def _design_tools(self) -> list:
-        """Everything the generate LLM can call: research tools, the seed
-        library, the notes tool (only if use_notes_tool), and ALWAYS the
-        evaluate tool."""
-        tools = list(self.generate_tools) + [self.seed_library_tool]
-        if self.use_notes_tool:
-            tools.append(self.check_notes_tool)
-        tools.append(self.evaluate_tool)
-        return self._dedupe_tools(tools)
-
-    @staticmethod
-    def _dedupe_tools(tools) -> list:
-        seen: dict = {}
-        for t in tools:
-            seen[t.name] = t
-        return list(seen.values())
+    # implemented in pipeline_helpers.from_model; exposed unchanged as
+    # AgentPipeline.from_model(task, model, ...)
+    from_model = classmethod(_from_model)
 
     # ------------------------------------------------------------------ helpers
-    def _sys(self, agent_type: str, default: str) -> str:
-        """Task system prompt for `agent_type`, falling back to `default`."""
-        try:
-            return self.task.system_prompt(agent_type)
-        except KeyError:
-            return default
-
-    def _log_system(self, role: str, content: str) -> None:
-        """Log a role's system prompt on first use and whenever it changes
-        (e.g. generate's gains the explorer notes after the handoff)."""
-        if self._logged_systems.get(role) != content:
-            self._logged_systems[role] = content
-            self.task.log(f"SYSTEM PROMPT ({role})", content)
-
-    def _note(self, section: str, text: str) -> None:
-        """Append a finding to the persistent notes file (research storage)."""
-        os.makedirs(os.path.dirname(self.notes_path), exist_ok=True)
-        with open(self.notes_path, "a", encoding="utf-8") as f:
-            f.write(f"\n## {section}\n{text}\n")
-
-    def _invoke_tool(self, tool_map: dict, call: dict,
-                     note: bool = False) -> tuple[ToolMessage, Optional[dict]]:
-        """Run ONE tool call with timing and logging.
-
-        `note=True` (explorer channel only) also appends the result to the
-        notes file -- the notes file is the EXPLORER'S record, nothing else
-        writes to it.
-
-        Returns (ToolMessage for the graph state, parsed JSON dict or None).
-        """
-        tool_obj = tool_map.get(call["name"])
-        t0 = time.perf_counter()
-        try:
-            out = (tool_obj.invoke(call["args"]) if tool_obj
-                   else json.dumps({"ok": False, "error": f"unknown tool {call['name']}"}))
-        except Exception as exc:
-            out = json.dumps({"ok": False, "error": f"tool raised: {exc}"})
-        dt = time.perf_counter() - t0
-        out = str(out)
-        # log the INPUTS too (e.g. the exact code a trial evaluated), in full --
-        # the transcript is the record of what was actually tested
-        args_lines = []
-        for k, v in (call.get("args") or {}).items():
-            v_str = v if isinstance(v, str) else json.dumps(v)
-            args_lines.append(f"{k}:\n{v_str}" if "\n" in v_str else f"{k}: {v_str}")
-        args_view = "\n".join(args_lines) or "(no args)"
-        self.task.log(f"TOOL {call['name']} [tool {dt:.2f}s]",
-                      f"--- args ---\n{args_view}\n--- result ---\n{out[:]}")
-        if note:
-            self._note(f"TOOL {call['name']}", out[:])
-        try:
-            parsed = json.loads(out)
-        except (json.JSONDecodeError, TypeError):
-            parsed = None
-        return (ToolMessage(content=out, tool_call_id=call["id"], name=call["name"]),
-                parsed)
-
     def _run_with_tools(self, llm, tools, messages):
         """Invoke an LLM, servicing any tool calls, until it returns plain text.
 
@@ -524,7 +230,7 @@ class AgentPipeline:
                         content=json.dumps({"ok": False, "skipped": skip}),
                         tool_call_id=call["id"], name=call["name"]))
                     continue
-                msg, _ = self._invoke_tool(tool_map, call)
+                msg, _ = invoke_tool(self, tool_map, call)
                 calls_used += 1
                 convo.append(msg)
         # budget exhausted while still calling tools: demand a final summary
@@ -548,9 +254,9 @@ class AgentPipeline:
                    "library). Take concise, actionable notes for the designer. "
                    "When you have enough, stop calling tools and respond with a "
                    "short notes summary.")
-        sys_content = self._sys("explore", default)
-        self._log_system("explorer", sys_content)
-        bound = self.explorer_llm.bind_tools(self._explorer_toolset())
+        sys_content = sys_prompt(self.task, "explore", default)
+        log_system(self, "explorer", sys_content)
+        bound = self.explorer_llm.bind_tools(explorer_toolset(self))
         t0 = time.perf_counter()
         resp = bound.invoke([SystemMessage(content=sys_content)]
                             + state["explore_messages"])
@@ -563,7 +269,7 @@ class AgentPipeline:
         text = _text_of(resp).strip()
         if text:
             notes = f"{notes}\n\n{text}".strip() if notes else text
-            self._note(f"EXPLORE (round {rounds})", text)
+            append_note(self, f"EXPLORE (round {rounds})", text)
 
         out: dict = {"explore_messages": [resp], "explore_rounds": rounds,
                      "notes": notes}
@@ -589,8 +295,8 @@ class AgentPipeline:
         its one extra (notes) turn writing final notes rather than making tool
         calls that would be dropped when the handoff is forced."""
         last = state["explore_messages"][-1]
-        tool_map = {t.name: t for t in self._explorer_toolset()}
-        out = [self._invoke_tool(tool_map, call, note=True)[0]
+        tool_map = {t.name: t for t in explorer_toolset(self)}
+        out = [invoke_tool(self, tool_map, call, note=True)[0]
                for call in last.tool_calls]
         if state.get("explore_rounds", 0) >= self.max_explore_rounds:
             warning = ("You have used all your research rounds. Do NOT call "
@@ -627,8 +333,8 @@ class AgentPipeline:
         # after the variant it names, not at position 0 before that variant's
         # own messages) and does not invalidate the cached system prompt.
         sys_content = self._generate_system(state)
-        self._log_system("generate", sys_content)
-        bound = self.generate_llm.bind_tools(self._design_tools())
+        log_system(self, "generate", sys_content)
+        bound = self.generate_llm.bind_tools(design_tools(self))
         t0 = time.perf_counter()
         resp = bound.invoke([SystemMessage(content=sys_content)]
                             + state["messages"])
@@ -704,7 +410,7 @@ class AgentPipeline:
         default submission is the session's BEST design, not its latest.
         """
         last = state["messages"][-1]
-        tool_map = {t.name: t for t in self._design_tools()}
+        tool_map = {t.name: t for t in design_tools(self)}
         trials = state.get("session_trials", 0)
         n_before = trials
         research = state.get("session_research", 0)
@@ -729,7 +435,7 @@ class AgentPipeline:
                         content=json.dumps({"ok": False, "skipped": skip_reason}),
                         tool_call_id=call["id"], name=call["name"]))
                 else:
-                    msg, _ = self._invoke_tool(tool_map, call)
+                    msg, _ = invoke_tool(self, tool_map, call)
                     research += 1
                     executed_any = True
                     left = self.max_session_research - research
@@ -746,7 +452,7 @@ class AgentPipeline:
                                "trials reached; reply WITHOUT tools to submit "
                                "your design for official evaluation")
             else:
-                msg, parsed = self._invoke_tool(tool_map, call)
+                msg, parsed = invoke_tool(self, tool_map, call)
                 out_messages.append(msg)
                 trials += 1
                 executed_any = True
@@ -908,8 +614,8 @@ class AgentPipeline:
                 "them ONE AT A TIME so each call can react to the previous "
                 "result; try not to batch several calls in one turn.")
         review_system += ("\n\n# Seed library (known-good reference designs)\n"
-                          + self._seed_block())
-        self._log_system("review", review_system)
+                          + seed_block(self.task))
+        log_system(self, "review", review_system)
         resp, _, dt = self._run_with_tools(
             self.review_llm, self.review_tools,
             [SystemMessage(content=review_system)]
@@ -925,7 +631,7 @@ class AgentPipeline:
             f"Reviewer feedback on variant #{m.get('variant', '?')} ({submitted}) "
             f"-- NOT necessarily your latest attempt:\n{note}")
         design_msgs = [HumanMessage(content=feedback_msg)]
-        foundation = self._best_so_far_note(state)
+        foundation = best_so_far_note(self, state)
         if foundation:
             design_msgs.append(HumanMessage(content=foundation))
         # log the design-thread hand-off exactly as the NEXT generate will see
@@ -942,24 +648,6 @@ class AgentPipeline:
                 "review_messages": [HumanMessage(content=prompt),
                                     AIMessage(content=note)],
                 "messages": design_msgs}
-
-    def _best_so_far_note(self, state: PipelineState) -> str:
-        """Factual 'current best' line, injected into the DESIGN THREAD at
-        session start (not the system prompt) so it sits after the variant it
-        names -- correct chronological order -- and keeps the system prompt
-        static. The how-to (build on it / when to resubmit) lives in the task's
-        generate prompt; this only supplies the live numbers. Empty until a
-        best exists (session 1, where the task prompt points at the best seed)."""
-        best = state.get("best") or {}
-        if not best.get("code"):
-            return ""
-        bm = best.get("metrics") or {}
-        return (
-            f"Current best is variant #{best.get('variant', '?')} "
-            f"({self.target_metric}={best.get(self.target_metric)}, "
-            f"gates={bm.get('n_gates')}, depth={bm.get('depth')}) -- it is saved "
-            "and cannot be lost. Build on it per your Strategy (refine it to beat "
-            "it, or try a fresh direction if it is weak).")
 
     def deploy_node(self, state: PipelineState) -> dict:
         best = dict(state.get("best") or {})
@@ -998,7 +686,7 @@ class AgentPipeline:
         # circuit from JSON. What the deploy step should PRODUCE (the report
         # framing) is given in the user turn below; tools are NOT bound.
         gen_system = self._generate_system(state)
-        self._log_system("generate", gen_system)   # log if it changed since last
+        log_system(self, "generate", gen_system)   # log if it changed since last
         deploy_ask = self.task.system_prompt("deploy")
         t0 = time.perf_counter()
         summary_resp = self.generate_llm.invoke(
@@ -1031,13 +719,6 @@ class AgentPipeline:
                                  "summary": summary, "translated": translated}}
 
     # --------------------------------------------------------------- edges
-    def _done(self, state: PipelineState) -> bool:
-        """Deterministic stop check: budget exhausted or target reached."""
-        if state.get("iteration", 0) >= self.max_iters:
-            return True
-        best = state.get("best") or {}
-        return best.get(self.target_metric, -1.0) >= self.target_value - 1e-9
-
     def _route_after_explorer(self, state: PipelineState) -> str:
         last = state["explore_messages"][-1]
         # <= max (not <): after the max-th research round we still enter
@@ -1075,10 +756,10 @@ class AgentPipeline:
         return "generate"
 
     def _route_after_evaluate(self, state: PipelineState) -> str:
-        return "deploy" if self._done(state) else "review"
+        return "deploy" if done(self, state) else "review"
 
     def _route_after_review(self, state: PipelineState) -> str:
-        return "deploy" if self._done(state) else "generate"
+        return "deploy" if done(self, state) else "generate"
 
     # --------------------------------------------------------------- graph
     def build_graph(self):
@@ -1189,8 +870,8 @@ class AgentPipeline:
                       f"{self.task.describe()}\n"
                       f"explorer={'ON' if self.use_explorer else 'OFF'} "
                       f"notes_tool={'ON' if self.use_notes_tool else 'OFF'} "
-                      f"explorer_tools={[t.name for t in self._explorer_toolset()]}\n"
-                      f"design_tools={[t.name for t in self._design_tools()]} "
+                      f"explorer_tools={[t.name for t in explorer_toolset(self)]}\n"
+                      f"design_tools={[t.name for t in design_tools(self)]} "
                       f"review_tools={[t.name for t in self.review_tools]}\n"
                       f"max_iters={self.max_iters} (official variants) "
                       f"target={self.target_metric}>={self.target_value} "
