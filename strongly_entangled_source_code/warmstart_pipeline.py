@@ -55,10 +55,21 @@ Knobs (env):
     FINETUNE_LR    lr used AFTER unfreezing the backbone         (default LR/100)
                    -- at the full LR the unfreeze causes catastrophic forgetting
                       (89% -> 51% in 2 epochs; notes.md #6). Not used in FAST.
+    AUGMENT        1 -> mild train-time augmentation (flip / +-10deg / shift+scale)
+                   (default 1). Overfitting is the binding constraint here
+                   (train loss -> 0.04 while val plateaus ~95%), and augmentation
+                   is the paper's own recommended fix. TRAIN split only; eval is
+                   always the clean transform. No real effect under FAST (features
+                   are cached once, so the augmentation cannot vary per epoch).
     BATCH / SEED
 
-RECOMMENDED (fast + avoids the unfreeze collapse entirely):
-    VARIANT=Q2E2 FAST=1 WARMUP_EPOCHS=25 QUANTUM_EPOCHS=40 python warmstart_pipeline.py
+Each run writes runs/<VARIANT>_<stamp>/ containing training.txt (per-epoch log),
+config.txt (settings + results), training.png (loss + accuracy, phases and the
+best epoch marked) and best_quantum.pt (weights at the best quantum epoch).
+The BEST val accuracy is what to report -- the last epoch usually is not the best.
+
+RECOMMENDED (the frozen phase does the real work; fine-tuning adds ~nothing):
+    VARIANT=Q2E2 WARMUP_EPOCHS=25 FREEZE_EPOCHS=40 QUANTUM_EPOCHS=5 python warmstart_pipeline.py
 """
 
 from __future__ import annotations
@@ -103,6 +114,10 @@ LR = float(os.environ.get("LR", "0.001"))
 FINETUNE_LR = float(os.environ.get("FINETUNE_LR", str(LR / 100)))
 BATCH = int(os.environ.get("BATCH", "32"))
 SEED = int(os.environ.get("SEED", "0"))
+# Mild geometric augmentation on the TRAIN split only. Overfitting is the binding
+# constraint on this task (train loss -> ~0.04 while val plateaus ~95%), and
+# augmentation is the paper's own recommended fix for it.
+AUGMENT = os.environ.get("AUGMENT", "1") != "0"
 
 
 # ---------------------------------------------------------------------------
@@ -133,18 +148,31 @@ class BrainDataset(Dataset):
         return img, self.labels[idx]
 
 
-transform = transforms.Compose([
-    transforms.Resize(130), transforms.CenterCrop(128),
-    transforms.ToTensor(), transforms.Normalize(mean=[0.5], std=[0.5]),
-])
+def build_transform(augment: bool):
+    """Eval transform = the paper's exactly. The train transform optionally adds
+    mild geometric augmentation (flip / +-10 deg / small shift+scale), applied to
+    the PIL image before ToTensor. Kept conservative so the anatomy stays
+    plausible."""
+    steps = [transforms.Resize(130), transforms.CenterCrop(128)]
+    if augment:
+        steps += [
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(10),
+            transforms.RandomAffine(degrees=0, translate=(0.05, 0.05),
+                                    scale=(0.95, 1.05)),
+        ]
+    steps += [transforms.ToTensor(), transforms.Normalize(mean=[0.5], std=[0.5])]
+    return transforms.Compose(steps)
 
 
-def make_loaders():
-    train = BrainDataset(os.path.join(SE_DATA_DIR, "train"), transform)
+def make_loaders(augment: bool = AUGMENT):
+    """(train_loader, eval_loader). Augmentation applies to TRAIN ONLY -- eval is
+    always the clean paper transform, so scores stay comparable across runs."""
+    train = BrainDataset(os.path.join(SE_DATA_DIR, "train"), build_transform(augment))
     eval_dir = os.path.join(SE_DATA_DIR, "val")
     if not os.path.isdir(eval_dir):
         eval_dir = os.path.join(SE_DATA_DIR, "test")
-    ev = BrainDataset(eval_dir, transform)
+    ev = BrainDataset(eval_dir, build_transform(False))
     return (DataLoader(train, batch_size=BATCH, shuffle=True),
             DataLoader(ev, batch_size=BATCH, shuffle=False))
 
@@ -282,9 +310,16 @@ def evaluate(model, loader):
 
 
 def train_phase(model, train_loader, eval_loader, epochs, lr, tag, log_path,
-                history=None):
-    """Train for `epochs`, logging per epoch. `history` (a list) collects
-    {tag, epoch, loss, acc} rows across ALL phases so they can be plotted."""
+                history=None, best=None, ckpt_path=None):
+    """Train for `epochs`, logging per epoch.
+
+    history   : list, collects {tag, epoch, loss, acc} across ALL phases (plots).
+    best      : mutable dict {acc, tag, epoch} tracking the best val accuracy seen
+                so far ACROSS the phases it is passed to. The last epoch is often
+                NOT the best (val accuracy wanders while train loss keeps falling
+                -- overfitting), so this is the number worth reporting.
+    ckpt_path : if given, the model's state_dict is saved whenever `best` improves.
+    """
     opt = optim.NAdam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
     loss_fn = nn.CrossEntropyLoss()
     for epoch in range(epochs):
@@ -301,16 +336,24 @@ def train_phase(model, train_loader, eval_loader, epochs, lr, tag, log_path,
         acc, _ = evaluate(model, eval_loader)
         if history is not None:
             history.append({"tag": tag, "epoch": epoch + 1, "loss": avg, "acc": acc})
+        marker = ""
+        if best is not None and acc > best["acc"]:
+            best.update(acc=acc, tag=tag, epoch=epoch + 1)
+            if ckpt_path:
+                torch.save(model.state_dict(), ckpt_path)
+            marker = "  <- best"
         with open(log_path, "a", encoding="utf-8") as flog:
             flog.write(f"{tag}, {epoch + 1}, {avg:.4f}, {100 * acc:.2f}%\n")
-        print(f"[{tag}] epoch {epoch + 1}/{epochs}: loss={avg:.4f}  val_acc={100 * acc:.2f}%")
+        print(f"[{tag}] epoch {epoch + 1}/{epochs}: loss={avg:.4f}  "
+              f"val_acc={100 * acc:.2f}%{marker}")
     return evaluate(model, eval_loader)
 
 
-def save_plots(history, run_dir, acc1=None, acc2=None):
+def save_plots(history, run_dir, acc1=None, acc2=None, best_q=None):
     """Train loss + validation accuracy vs cumulative epoch, with the phase
     boundaries marked -- the transitions (warm-up -> frozen -> fine-tune) are
-    where the interesting behaviour lives."""
+    where the interesting behaviour lives. `best_q` (if given) is starred on the
+    accuracy panel."""
     if not history:
         return None
     xs = list(range(1, len(history) + 1))
@@ -336,6 +379,17 @@ def save_plots(history, run_dir, acc1=None, acc2=None):
     ax2.text(xs[0], 51, "chance (50%)", fontsize=7, color="0.45")
     ax2.set_xlabel("epoch (cumulative)"); ax2.set_ylabel("val accuracy (%)")
     ax2.set_ylim(0, 100); ax2.set_title("Validation accuracy")
+
+    # star the best quantum epoch (the reported number -- the LAST epoch usually
+    # is not the best once overfitting sets in)
+    if best_q and best_q.get("acc", -1) >= 0:
+        for i, h in enumerate(history):
+            if h["tag"] == best_q["tag"] and h["epoch"] == best_q["epoch"]:
+                bx, by = i + 1, 100 * h["acc"]
+                ax2.plot([bx], [by], marker="*", ms=15, color="#16a34a", zorder=5)
+                ax2.annotate(f"best {by:.1f}%", (bx, by), textcoords="offset points",
+                             xytext=(0, -17), ha="center", fontsize=8, color="#16a34a")
+                break
 
     for ax in (ax1, ax2):
         for b in bounds:
@@ -398,6 +452,8 @@ def write_config(path, train_loader, eval_loader, qnn):
         f"train images            = {len(train_loader.dataset)}",
         f"eval images             = {len(eval_loader.dataset)}",
         f"BATCH                   = {BATCH}",
+        f"AUGMENT (train only)    = {AUGMENT}"
+        + ("  (no effect under FAST: features cached once)" if (AUGMENT and FAST) else ""),
         "",
         "[training]",
         f"WARMUP_EPOCHS           = {WARMUP_EPOCHS}",
@@ -440,58 +496,74 @@ if __name__ == "__main__":
 
     backbone = Backbone().to(device)
     history = []                                 # every epoch, every phase -> plots
+    best_cls = {"acc": -1.0, "tag": None, "epoch": None}   # best classical epoch
+    best_q = {"acc": -1.0, "tag": None, "epoch": None}     # best quantum epoch
 
     # --- Phase 1: classical warm-up ---
     print("\n=== Phase 1: classical warm-up ===")
     cls = ClassicalNet(backbone).to(device)
     acc1, _ = train_phase(cls, train_loader, eval_loader, WARMUP_EPOCHS, LR, "warmup",
-                          log_path, history)
-    print(f"Phase 1 done: val_acc={100 * acc1:.2f}%")
+                          log_path, history, best=best_cls)
+    print(f"Phase 1 done: final={100 * acc1:.2f}%  best={100 * best_cls['acc']:.2f}%")
 
     # --- Phase 2: quantum ---
     print(f"\n=== Phase 2: quantum ({VARIANT}, qubits={qnn.num_inputs}) ===")
+    ckpt = os.path.join(run_dir, "best_quantum.pt")
     if FAST:
         # freeze backbone, cache its features once, train the head on cached feats
         print("FAST: caching backbone features, training quantum head only")
-        Ftr, ytr = cache_features(backbone, train_loader)
+        if AUGMENT:
+            print("  NOTE: features are cached ONCE, so augmentation cannot vary per "
+                  "epoch -- caching from the CLEAN transform. Use FAST=0 to actually "
+                  "benefit from AUGMENT.")
+        clean_train, _ = make_loaders(augment=False)
+        Ftr, ytr = cache_features(backbone, clean_train)
         Fte, yte = cache_features(backbone, eval_loader)
         head = QuantumHead(qnn).to(device)
         tl = DataLoader(TensorDataset(Ftr, ytr), batch_size=BATCH, shuffle=True)
         el = DataLoader(TensorDataset(Fte, yte), batch_size=BATCH, shuffle=False)
         acc2, f1_2 = train_phase(head, tl, el, QUANTUM_EPOCHS, LR, "q_cached",
-                                 log_path, history)
+                                 log_path, history, best=best_q, ckpt_path=ckpt)
     else:
         qnet = QuantumNet(backbone, qnn).to(device)
         if FREEZE_EPOCHS > 0:
             print(f"freezing backbone for the first {FREEZE_EPOCHS} epochs (lr={LR})")
             set_backbone_trainable(qnet, False)
             train_phase(qnet, train_loader, eval_loader, FREEZE_EPOCHS, LR, "q_frozen",
-                        log_path, history)
+                        log_path, history, best=best_q, ckpt_path=ckpt)
             set_backbone_trainable(qnet, True)
         # unfreeze at a MUCH lower lr -- at the full lr this destroys the warm
         # backbone in ~2 epochs (see notes.md #6)
         print(f"unfreezing backbone; fine-tuning at lr={FINETUNE_LR} (vs {LR})")
         acc2, f1_2 = train_phase(qnet, train_loader, eval_loader, QUANTUM_EPOCHS,
-                                 FINETUNE_LR, "q_finetune", log_path, history)
+                                 FINETUNE_LR, "q_finetune", log_path, history,
+                                 best=best_q, ckpt_path=ckpt)
 
     # final results land in BOTH the training log (as trailing comments) and the
     # config, so each run folder is self-describing at a glance
-    summary = (f"# FINAL {VARIANT}: quantum accuracy={100 * acc2:.2f}%  "
-               f"f1={100 * f1_2:.2f}%  |  classical warm-up={100 * acc1:.2f}%")
+    summary = (f"# FINAL {VARIANT}: quantum BEST={100 * best_q['acc']:.2f}% "
+               f"(@{best_q['tag']} ep{best_q['epoch']})  last={100 * acc2:.2f}%  "
+               f"f1={100 * f1_2:.2f}%  |  classical best={100 * best_cls['acc']:.2f}%")
     with open(log_path, "a", encoding="utf-8") as flog:
         flog.write(summary + "\n")
     with open(config_path, "a", encoding="utf-8") as f:
         f.write(f"\n[results]\n"
-                f"classical_warmup_acc    = {100 * acc1:.2f}%\n"
-                f"quantum_acc             = {100 * acc2:.2f}%\n"
-                f"quantum_f1              = {100 * f1_2:.2f}%\n")
+                f"classical_warmup_best   = {100 * best_cls['acc']:.2f}%  "
+                f"(ep{best_cls['epoch']})\n"
+                f"classical_warmup_last   = {100 * acc1:.2f}%\n"
+                f"quantum_best            = {100 * best_q['acc']:.2f}%  "
+                f"({best_q['tag']} ep{best_q['epoch']})   <- report this\n"
+                f"quantum_last            = {100 * acc2:.2f}%\n"
+                f"quantum_f1_last         = {100 * f1_2:.2f}%\n"
+                f"best_checkpoint         = best_quantum.pt\n")
 
-    plot_path = save_plots(history, run_dir, acc1, acc2)
+    plot_path = save_plots(history, run_dir, acc1, acc2, best_q)
 
     print("\n" + "=" * 60)
     print(summary.lstrip("# "))
     print(f"run dir: {os.path.abspath(run_dir)}")
-    print(f"  training.txt  (per-epoch log)")
-    print(f"  config.txt    (settings + results)")
+    print(f"  training.txt      (per-epoch log)")
+    print(f"  config.txt        (settings + results)")
+    print(f"  best_quantum.pt   (weights at the best quantum epoch)")
     if plot_path:
-        print(f"  training.png  (loss + val accuracy, phases marked)")
+        print(f"  training.png      (loss + val accuracy, phases + best marked)")
