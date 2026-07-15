@@ -10,7 +10,7 @@ trains perfectly on good features. The failure is that a **randomly-initialized
 CNN cannot bootstrap useful features *through* the 1-number quantum bottleneck**
 from scratch, so the joint optimization gets stuck in a 50% local minimum whose
 escape is a seed lottery. **Fix: warm-start the CNN** (train it classically first,
-then attach the quantum head). Implemented in `q2e2_warmstart.py`.
+then attach the quantum head). Implemented in `warmstart_pipeline.py`.
 
 ---
 
@@ -75,6 +75,32 @@ were **no better and sometimes worse**. So this is not a classic barren plateau
 (it's only 2 qubits — gradients don't vanish), and the head architecture is not
 the problem.
 
+**6. CONFIRMED on real Br35H data: warm-start fixes the stall — but unfreezing at
+the same lr destroys it.** Real run, `VARIANT=Q2E2`, default params:
+```
+warmup     ep 1  66.0%  ->  ep 25  96.5% (peak),  ends 95.0%
+q_frozen   ep 1  82.5%  ->  ep 6   90.5%,         ends 89.0%  (still climbing)
+q_finetune ep 1  80.5%  ->  ep 2  54.5%  ->  ep 3  51.5%   (loss 0.32 -> 0.85)
+           ... 40 epochs of recovery, only back to 85.0%
+```
+Three things this proves:
+- **The 50% stall is GONE.** With a warm backbone the quantum head starts at
+  82.5% *on epoch 1* and reaches 90.5% — exactly what #3/#5 predicted.
+- **The data/split are fine.** The classical backbone reaches 96.5%, *better*
+  than the paper's own CNN baseline (90.8%). The original stall was never a data
+  problem.
+- **Unfreezing at the same lr = catastrophic forgetting.** 4.3M converged
+  parameters + a freshly reset optimizer + lr=1e-3 wreck the learned features in
+  two epochs, and 40 epochs of recovery still end *below* the frozen phase
+  (85.0% vs 90.5%). Fix: `FINETUNE_LR` (default `LR/100`), or simply keep the
+  backbone frozen (`FAST=1`) — the frozen phase was the best part of the run.
+
+**Caveat worth reporting:** here the **classical head (96.5%) beats the quantum
+hybrid (90.5%)**, i.e. this does *not* reproduce the paper's CNN 90.8% -> Q2E2
+95% claim. That is consistent with #3/#5: squeezing 512 features through 2 encoder
+inputs into a **single scalar measurement** is a capacity bottleneck. Our classical
+baseline is simply stronger than theirs, so the quantum layer has nothing to add.
+
 ## Conclusion
 
 Combining #3 (fails behind a *random* CNN) with #5 (succeeds on *good* features):
@@ -88,7 +114,8 @@ enough capacity to give the CNN a strong gradient immediately.
 
 Give the quantum head good features to start from — **warm-start / pretrain the
 CNN**, the #1 literature-recommended barren-plateau mitigation ("pretraining with
-classical neural networks"). `q2e2_warmstart.py` does this as staged training:
+classical neural networks"). `warmstart_pipeline.py` does this as staged training
+(one file, all variants — `VARIANT=Q2E2|Q2E1|Q4E1|Q4E2`):
 
 - **Phase 1:** train the backbone (`conv1-4 → fc1`) + a plain `Linear(512,2)`
   head classically — learns good tumour/healthy features (robust).

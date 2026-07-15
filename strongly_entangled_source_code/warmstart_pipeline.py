@@ -1,28 +1,47 @@
 #!/usr/bin/env python
 """
-warmstart_pipeline.py -- generalized warm-start (staged) training for ANY of the
-strongly-entangled variants: Q2E1, Q2E2, Q4E1, Q4E2 (Q8* too, but slow).
+warmstart_pipeline.py -- warm-started (staged) training for the strongly-entangled
+variants: Q2E1, Q2E2, Q4E1, Q4E2 (Q8* too, but slow).
 
-Same idea as q2e2_warmstart.py, but the ONE thing that differs between variants
--- the quantum head -- is parameterized, so a single file trains all of them:
+WHY (full evidence in notes.md): the paper's hybrid stalls at exactly 50% because
+a randomly-initialized CNN cannot bootstrap useful features THROUGH the 1-number
+quantum bottleneck, so the joint optimization sits in a 50% local minimum whose
+escape is a seed lottery. The quantum head itself is fine -- on good features it
+trains robustly (measured: 4/4 seeds perfect). Fix: give it good features first,
+i.e. warm-start the CNN.
+
+HOW -- two phases, ONE model, NO cross-file weight loading:
+    Phase 1  classical warm-up: Backbone (conv1-4 -> fc1 -> 512 feats) + a plain
+             Linear(512, 2) head, trained end-to-end. Learns good tumour-vs-
+             healthy features (this part trains robustly).
+    Phase 2  quantum: KEEP the same, now-warm Backbone, drop the Phase-1 linear
+             head, attach the variant's quantum head (fc2 -> QNN -> fc3 -> cat),
+             and train. The head now sees GOOD features instead of random noise.
+
+The shared part (conv1-4 + fc1) is the SAME `Backbone` object reused across both
+phases, so it is already warm in Phase 2 with zero weight copying -- which also
+sidesteps the fc2 shape difference (512->1 in the paper's classical CNN.py vs
+512->2/4 in the quantum nets): the Phase-1 head is simply discarded and the
+quantum fc2 is trained fresh. Standard transfer learning: keep the backbone,
+swap the head.
+
+ONE FILE, ALL VARIANTS: the only thing that differs between variants is the
+quantum head, which is parameterized:
 
     VARIANT=Q4E2 SE_DATA_DIR=./data/Br35H python warmstart_pipeline.py
 
-What varies per variant (nothing else changes):
     * encoder E1 vs E2  -> z_feature_map (product) vs zz_feature_map (entangled)
     * width Q2 vs Q4    -> 2 vs 4 qubits; Q2 uses a RealAmplitudes VQC, Q4 uses
                            the paper's conv/pool ansatz
     * fc2 width         -> auto-sized to qnn.num_inputs (2 or 4). No manual edits.
 
-Two phases (see q2e2_warmstart.py / notes.md for the why):
-    Phase 1  classical warm-up: Backbone + Linear(512,2) -> learns good features.
-    Phase 2  quantum fine-tune: SAME warm Backbone + the variant's quantum head.
-
 SPEED (FAST=1): after Phase 1, freeze the warm backbone and CACHE its 512-d
 features once, then train the quantum head on the cached features -- no CNN
-forward/backward in Phase 2, which is the big time saver (see the time notes at
-the bottom). Trade-off: the backbone is not fine-tuned in Phase 2 (it's already
-good from Phase 1), so accuracy may be marginally lower for a large speedup.
+forward/backward in Phase 2, which is the big time saver. Trade-off: the backbone
+is not fine-tuned in Phase 2 (it's already good from Phase 1), so accuracy may be
+marginally lower for a large speedup. Note the quantum head runs on a CPU
+statevector with parameter-shift gradients, so IT -- not the GPU -- is the
+bottleneck: cut time by lowering QUANTUM_EPOCHS and using fewer training images.
 
 Knobs (env):
     VARIANT        Q2E1 | Q2E2 | Q4E1 | Q4E2   (default Q2E2)
@@ -32,7 +51,14 @@ Knobs (env):
     FREEZE_EPOCHS  freeze backbone for first N Phase-2 epochs (default 10;
                    ignored in FAST mode, where the backbone is always frozen)
     FAST           1 -> cache features, train head only (fast)   (default 0)
-    LR / BATCH / SEED
+    LR             training lr for Phase 1 + the frozen head     (default 1e-3)
+    FINETUNE_LR    lr used AFTER unfreezing the backbone         (default LR/100)
+                   -- at the full LR the unfreeze causes catastrophic forgetting
+                      (89% -> 51% in 2 epochs; notes.md #6). Not used in FAST.
+    BATCH / SEED
+
+RECOMMENDED (fast + avoids the unfreeze collapse entirely):
+    VARIANT=Q2E2 FAST=1 WARMUP_EPOCHS=25 QUANTUM_EPOCHS=40 python warmstart_pipeline.py
 """
 
 from __future__ import annotations
@@ -68,6 +94,10 @@ QUANTUM_EPOCHS = int(os.environ.get("QUANTUM_EPOCHS", "40"))
 FREEZE_EPOCHS = int(os.environ.get("FREEZE_EPOCHS", "10"))
 FAST = os.environ.get("FAST", "0") != "0"
 LR = float(os.environ.get("LR", "0.001"))
+# Fine-tuning a CONVERGED backbone must use a much smaller lr than training it
+# from scratch: at the same lr, unfreezing wrecks the learned features in ~2
+# epochs (catastrophic forgetting -- measured, see notes.md evidence #6).
+FINETUNE_LR = float(os.environ.get("FINETUNE_LR", str(LR / 100)))
 BATCH = int(os.environ.get("BATCH", "32"))
 SEED = int(os.environ.get("SEED", "0"))
 
@@ -318,12 +348,15 @@ if __name__ == "__main__":
     else:
         qnet = QuantumNet(backbone, qnn).to(device)
         if FREEZE_EPOCHS > 0:
-            print(f"freezing backbone for the first {FREEZE_EPOCHS} epochs")
+            print(f"freezing backbone for the first {FREEZE_EPOCHS} epochs (lr={LR})")
             set_backbone_trainable(qnet, False)
             train_phase(qnet, train_loader, eval_loader, FREEZE_EPOCHS, LR, "q_frozen", log_path)
             set_backbone_trainable(qnet, True)
-        acc2, f1_2 = train_phase(qnet, train_loader, eval_loader, QUANTUM_EPOCHS, LR,
-                                 "q_finetune", log_path)
+        # unfreeze at a MUCH lower lr -- at the full lr this destroys the warm
+        # backbone in ~2 epochs (see notes.md #6)
+        print(f"unfreezing backbone; fine-tuning at lr={FINETUNE_LR} (vs {LR})")
+        acc2, f1_2 = train_phase(qnet, train_loader, eval_loader, QUANTUM_EPOCHS,
+                                 FINETUNE_LR, "q_finetune", log_path)
 
     print("\n" + "=" * 60)
     print(f"FINAL {VARIANT}: accuracy={100 * acc2:.2f}%  f1={100 * f1_2:.2f}%  "
