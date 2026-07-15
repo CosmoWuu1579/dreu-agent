@@ -315,16 +315,70 @@ def set_backbone_trainable(net, flag):
         p.requires_grad_(flag)
 
 
+def write_config(path, train_loader, eval_loader, qnn):
+    """Snapshot every setting that affects this run, next to its training log, so
+    any result can be reproduced from the folder it sits in."""
+    import qiskit
+    import qiskit_machine_learning as qml_pkg
+    n = qnn.num_inputs
+    lines = [
+        f"# warmstart_pipeline run config -- {datetime.datetime.now():%Y-%m-%d %H:%M:%S}",
+        "",
+        "[variant]",
+        f"VARIANT                 = {VARIANT}",
+        f"qubits (qnn.num_inputs) = {n}",
+        f"quantum weights (#Para) = {qnn.num_weights}",
+        f"encoder                 = " + ("z_feature_map (E1, product, no entanglement)"
+                                         if VARIANT.endswith("1") else
+                                         "zz_feature_map (E2, pairwise-entangled)"),
+        f"ansatz                  = " + ("real_amplitudes(reps=1)" if n == 2
+                                         else "conv/pool (paper's QCNN ansatz)"),
+        "",
+        "[data]",
+        f"SE_DATA_DIR             = {os.path.abspath(SE_DATA_DIR)}",
+        f"train images            = {len(train_loader.dataset)}",
+        f"eval images             = {len(eval_loader.dataset)}",
+        f"BATCH                   = {BATCH}",
+        "",
+        "[training]",
+        f"WARMUP_EPOCHS           = {WARMUP_EPOCHS}",
+        f"FREEZE_EPOCHS           = {FREEZE_EPOCHS}",
+        f"QUANTUM_EPOCHS          = {QUANTUM_EPOCHS}",
+        f"FAST                    = {FAST}",
+        f"LR                      = {LR}",
+        f"FINETUNE_LR             = {FINETUNE_LR}",
+        f"SEED                    = {SEED}",
+        "",
+        "[env]",
+        f"device                  = {device}",
+        f"torch                   = {torch.__version__}",
+        f"qiskit                  = {qiskit.__version__}",
+        f"qiskit-machine-learning = {qml_pkg.__version__}",
+    ]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     manual_seed(SEED); np.random.seed(SEED)
+
+    # one folder per run: runs/<VARIANT>_<stamp>/ holds the training log + the
+    # config snapshot that produced it
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = f"warmstart_{VARIANT}_{stamp}.txt"
-    with open(log_path, "w", encoding="utf-8") as flog:
-        flog.write(f"# variant={VARIANT} fast={FAST}\nphase, epoch, train_loss, val_accuracy(%)\n")
-    print(f"variant={VARIANT}  device={device}  fast={FAST}  data={SE_DATA_DIR}  log={log_path}")
+    run_dir = os.path.join("runs", f"{VARIANT}_{stamp}")
+    os.makedirs(run_dir, exist_ok=True)
+    log_path = os.path.join(run_dir, "training.txt")
+    config_path = os.path.join(run_dir, "config.txt")
 
     train_loader, eval_loader = make_loaders()
+    qnn = create_qnn(VARIANT)                    # built early so config can log it
+    write_config(config_path, train_loader, eval_loader, qnn)
+    with open(log_path, "w", encoding="utf-8") as flog:
+        flog.write("phase, epoch, train_loss, val_accuracy(%)\n")
+    print(f"run dir: {os.path.abspath(run_dir)}")
+    print(f"variant={VARIANT}  device={device}  fast={FAST}  data={SE_DATA_DIR}")
+
     backbone = Backbone().to(device)
 
     # --- Phase 1: classical warm-up ---
@@ -334,7 +388,6 @@ if __name__ == "__main__":
     print(f"Phase 1 done: val_acc={100 * acc1:.2f}%")
 
     # --- Phase 2: quantum ---
-    qnn = create_qnn(VARIANT)
     print(f"\n=== Phase 2: quantum ({VARIANT}, qubits={qnn.num_inputs}) ===")
     if FAST:
         # freeze backbone, cache its features once, train the head on cached feats
@@ -358,7 +411,20 @@ if __name__ == "__main__":
         acc2, f1_2 = train_phase(qnet, train_loader, eval_loader, QUANTUM_EPOCHS,
                                  FINETUNE_LR, "q_finetune", log_path)
 
+    # final results land in BOTH the training log (as trailing comments) and the
+    # config, so each run folder is self-describing at a glance
+    summary = (f"# FINAL {VARIANT}: quantum accuracy={100 * acc2:.2f}%  "
+               f"f1={100 * f1_2:.2f}%  |  classical warm-up={100 * acc1:.2f}%")
+    with open(log_path, "a", encoding="utf-8") as flog:
+        flog.write(summary + "\n")
+    with open(config_path, "a", encoding="utf-8") as f:
+        f.write(f"\n[results]\n"
+                f"classical_warmup_acc    = {100 * acc1:.2f}%\n"
+                f"quantum_acc             = {100 * acc2:.2f}%\n"
+                f"quantum_f1              = {100 * f1_2:.2f}%\n")
+
     print("\n" + "=" * 60)
-    print(f"FINAL {VARIANT}: accuracy={100 * acc2:.2f}%  f1={100 * f1_2:.2f}%  "
-          f"(classical warm-up {100 * acc1:.2f}%)")
-    print(f"log: {log_path}")
+    print(summary.lstrip("# "))
+    print(f"run dir: {os.path.abspath(run_dir)}")
+    print(f"  training.txt  (per-epoch log)")
+    print(f"  config.txt    (settings + results)")
