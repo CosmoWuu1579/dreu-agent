@@ -64,12 +64,6 @@ SE_MINIMIZE_RESOURCES = os.environ.get("SE_MINIMIZE_RESOURCES", "0") != "0"
 # the whole CNN+quantum net on Br35H, CNN unfrozen). Needs the dataset + a GPU
 # and is MUCH slower. Default off: the fast frozen-feature proxy.
 SE_FULL = os.environ.get("SE_FULL", "0") != "0"
-# SE_FEATURES selects WHAT the frozen evaluator classifies (ignored when SE_FULL,
-# since the full evaluator trains on raw images):
-#   "adhoc" (default) -> qiskit ad_hoc stand-in vectors (fast, no dataset needed)
-#   "br35h"           -> real 512-d frozen-CNN features from Br35H (needs dataset
-#                        + torchvision; "the swap" -> see br35h_features.py)
-SE_FEATURES = os.environ.get("SE_FEATURES", "adhoc").strip().lower()
 
 
 def active_evaluator():
@@ -84,17 +78,9 @@ def active_evaluator():
 
 
 def _baseline_data(dim: int):
-    """Dataset arg for the active (frozen) evaluator:
-      SE_FULL          -> None (the full evaluator loads Br35H images itself)
-      SE_FEATURES=br35h-> real frozen-CNN features from Br35H (lazy import so
-                          torchvision/dataset are only required in this mode)
-      otherwise        -> the qiskit ad_hoc stand-in features."""
-    if SE_FULL:
-        return None
-    if SE_FEATURES == "br35h":
-        from br35h_features import load_br35h_features
-        return load_br35h_features()
-    return load_se_data(dim)
+    """Dataset arg for the active evaluator: None under SE_FULL (the full
+    evaluator loads Br35H images itself), else the frozen-proxy features."""
+    return None if SE_FULL else load_se_data(dim)
 
 
 def _limit(name: str) -> int | None:
