@@ -67,6 +67,9 @@ import os
 import datetime
 
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")            # headless (cluster-safe): save figures, never open a window
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -278,7 +281,10 @@ def evaluate(model, loader):
     return acc, f1
 
 
-def train_phase(model, train_loader, eval_loader, epochs, lr, tag, log_path):
+def train_phase(model, train_loader, eval_loader, epochs, lr, tag, log_path,
+                history=None):
+    """Train for `epochs`, logging per epoch. `history` (a list) collects
+    {tag, epoch, loss, acc} rows across ALL phases so they can be plotted."""
     opt = optim.NAdam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
     loss_fn = nn.CrossEntropyLoss()
     for epoch in range(epochs):
@@ -293,10 +299,63 @@ def train_phase(model, train_loader, eval_loader, epochs, lr, tag, log_path):
             losses.append(loss.item())
         avg = sum(losses) / max(len(losses), 1)
         acc, _ = evaluate(model, eval_loader)
+        if history is not None:
+            history.append({"tag": tag, "epoch": epoch + 1, "loss": avg, "acc": acc})
         with open(log_path, "a", encoding="utf-8") as flog:
             flog.write(f"{tag}, {epoch + 1}, {avg:.4f}, {100 * acc:.2f}%\n")
         print(f"[{tag}] epoch {epoch + 1}/{epochs}: loss={avg:.4f}  val_acc={100 * acc:.2f}%")
     return evaluate(model, eval_loader)
+
+
+def save_plots(history, run_dir, acc1=None, acc2=None):
+    """Train loss + validation accuracy vs cumulative epoch, with the phase
+    boundaries marked -- the transitions (warm-up -> frozen -> fine-tune) are
+    where the interesting behaviour lives."""
+    if not history:
+        return None
+    xs = list(range(1, len(history) + 1))
+    losses = [h["loss"] for h in history]
+    accs = [100 * h["acc"] for h in history]
+    tags = [h["tag"] for h in history]
+
+    # contiguous spans of the same phase -> boundaries + label positions
+    spans, start = [], 0
+    for i in range(1, len(tags) + 1):
+        if i == len(tags) or tags[i] != tags[start]:
+            spans.append((tags[start], start + 1, i))     # (tag, first, last)
+            start = i
+    bounds = [s[1] - 0.5 for s in spans[1:]]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
+    ax1.plot(xs, losses, color="#2563eb", lw=1.6)
+    ax1.set_xlabel("epoch (cumulative)"); ax1.set_ylabel("train loss")
+    ax1.set_title("Training loss")
+
+    ax2.plot(xs, accs, color="#d97706", lw=1.6)
+    ax2.axhline(50, ls=":", c="0.6", lw=1)               # chance line for binary
+    ax2.text(xs[0], 51, "chance (50%)", fontsize=7, color="0.45")
+    ax2.set_xlabel("epoch (cumulative)"); ax2.set_ylabel("val accuracy (%)")
+    ax2.set_ylim(0, 100); ax2.set_title("Validation accuracy")
+
+    for ax in (ax1, ax2):
+        for b in bounds:
+            ax.axvline(b, ls="--", c="0.5", lw=1)
+        ax.grid(alpha=0.3)
+        top = ax.get_ylim()[1]
+        for tag, a, b in spans:                           # phase name per span
+            ax.text((a + b) / 2, top * 0.97, tag, fontsize=7, color="0.35",
+                    ha="center", va="top")
+
+    title = f"{VARIANT}"
+    if acc1 is not None and acc2 is not None:
+        title += (f"  |  classical warm-up {100 * acc1:.1f}%  ->  "
+                  f"quantum {100 * acc2:.1f}%")
+    fig.suptitle(title)
+    fig.tight_layout()
+    path = os.path.join(run_dir, "training.png")
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+    return path
 
 
 def cache_features(backbone, loader):
@@ -380,11 +439,13 @@ if __name__ == "__main__":
     print(f"variant={VARIANT}  device={device}  fast={FAST}  data={SE_DATA_DIR}")
 
     backbone = Backbone().to(device)
+    history = []                                 # every epoch, every phase -> plots
 
     # --- Phase 1: classical warm-up ---
     print("\n=== Phase 1: classical warm-up ===")
     cls = ClassicalNet(backbone).to(device)
-    acc1, _ = train_phase(cls, train_loader, eval_loader, WARMUP_EPOCHS, LR, "warmup", log_path)
+    acc1, _ = train_phase(cls, train_loader, eval_loader, WARMUP_EPOCHS, LR, "warmup",
+                          log_path, history)
     print(f"Phase 1 done: val_acc={100 * acc1:.2f}%")
 
     # --- Phase 2: quantum ---
@@ -397,19 +458,21 @@ if __name__ == "__main__":
         head = QuantumHead(qnn).to(device)
         tl = DataLoader(TensorDataset(Ftr, ytr), batch_size=BATCH, shuffle=True)
         el = DataLoader(TensorDataset(Fte, yte), batch_size=BATCH, shuffle=False)
-        acc2, f1_2 = train_phase(head, tl, el, QUANTUM_EPOCHS, LR, "q_cached", log_path)
+        acc2, f1_2 = train_phase(head, tl, el, QUANTUM_EPOCHS, LR, "q_cached",
+                                 log_path, history)
     else:
         qnet = QuantumNet(backbone, qnn).to(device)
         if FREEZE_EPOCHS > 0:
             print(f"freezing backbone for the first {FREEZE_EPOCHS} epochs (lr={LR})")
             set_backbone_trainable(qnet, False)
-            train_phase(qnet, train_loader, eval_loader, FREEZE_EPOCHS, LR, "q_frozen", log_path)
+            train_phase(qnet, train_loader, eval_loader, FREEZE_EPOCHS, LR, "q_frozen",
+                        log_path, history)
             set_backbone_trainable(qnet, True)
         # unfreeze at a MUCH lower lr -- at the full lr this destroys the warm
         # backbone in ~2 epochs (see notes.md #6)
         print(f"unfreezing backbone; fine-tuning at lr={FINETUNE_LR} (vs {LR})")
         acc2, f1_2 = train_phase(qnet, train_loader, eval_loader, QUANTUM_EPOCHS,
-                                 FINETUNE_LR, "q_finetune", log_path)
+                                 FINETUNE_LR, "q_finetune", log_path, history)
 
     # final results land in BOTH the training log (as trailing comments) and the
     # config, so each run folder is self-describing at a glance
@@ -423,8 +486,12 @@ if __name__ == "__main__":
                 f"quantum_acc             = {100 * acc2:.2f}%\n"
                 f"quantum_f1              = {100 * f1_2:.2f}%\n")
 
+    plot_path = save_plots(history, run_dir, acc1, acc2)
+
     print("\n" + "=" * 60)
     print(summary.lstrip("# "))
     print(f"run dir: {os.path.abspath(run_dir)}")
     print(f"  training.txt  (per-epoch log)")
     print(f"  config.txt    (settings + results)")
+    if plot_path:
+        print(f"  training.png  (loss + val accuracy, phases marked)")
