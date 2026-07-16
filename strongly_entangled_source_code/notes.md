@@ -176,6 +176,51 @@ LLM adds nothing to grid search. The value is letting it **write circuits**
   epoch (not the last), and average 2 seeds for finalists.
 - Report the agent's winner on a held-out split, not the one used for selection.
 
+## How to run the two experiments
+
+No `.env` file is read -- export the variables (or inline them before the
+command). Cluster/bash syntax below.
+
+### Experiment A -- reliability vs the paper  (baseline_compare.py)
+Runs the paper's EXACT schedule (from scratch, lr 1e-5, no aug) and OUR schedule
+(warm-up -> frozen -> fine-tune) across seeds, and reports the DISTRIBUTION. The
+circuit is pinned to the paper's; only the schedule differs.
+
+    export SE_DATA_DIR=./data/Br35H
+    export CMP_VARIANTS=Q2E2            # or Q2E1,Q2E2,Q4E1,Q4E2
+    export CMP_SEEDS=0,1,2              # start small -- CPU statevector, slow
+    export ORIG_EPOCHS=60 ORIG_LR=0.00001         # paper's recipe (it used 300 ep)
+    export WARM_EPOCHS=25 QUANTUM_LR=0.001 FREEZE_EPOCHS=40 FINETUNE_EPOCHS=5
+    python baseline_compare.py
+
+Outputs -> runs/compare_<stamp>/: summary.txt, results.csv (best per seed),
+curves.csv (per-epoch loss+acc), <variant>_original.png and <variant>_warmstart.png
+(each method alone), <variant>_both.png (combined, paper overlaid from phase 2).
+Reads the paper's Table-2 numbers as reference lines. NO early stop / lr decay
+here on purpose: fixed epochs -> equal-length curves that can be averaged; it does
+NOT cost accuracy (best = max val acc over epochs is still captured).
+
+### Experiment B -- beat the baseline: capacity ablation  (warmstart_pipeline.py)
+Modify the CIRCUIT one knob at a time, SAME seed, and compare quantum_best + the
+train-loss floor. This deliberately DEVIATES from the paper (that is the point).
+
+    export SE_DATA_DIR=./data/Br35H VARIANT=Q2E2
+    export QUANTUM_LR=0.001 SCHEDULE=0 FREEZE_EPOCHS=40 QUANTUM_EPOCHS=5
+    # baseline (the paper's circuit)
+    OBSERVABLES=single     REUPLOAD=1 python warmstart_pipeline.py
+    # more observables: 1 -> 3 readouts (widen the measured bottleneck)
+    OBSERVABLES=local_corr REUPLOAD=1 python warmstart_pipeline.py
+    # data re-uploading: 4 -> 12 weights (re-inject x each layer)
+    OBSERVABLES=single     REUPLOAD=3 python warmstart_pipeline.py
+    # both
+    OBSERVABLES=local_corr REUPLOAD=3 python warmstart_pipeline.py
+
+Read quantum_best from each run's runs/<VARIANT>_<stamp>/config.txt. WATCH THE
+TRAIN-LOSS FLOOR (~0.28 at baseline): if adding readouts/weights drops it, the
+capacity bottleneck was the ceiling -- that confirms the mechanism. Do NOT set
+OBSERVABLES/REUPLOAD when running baseline_compare.py (it pins them anyway); keep
+the two experiments separate -- A = the paper's circuit, B = your modifications.
+
 ## Sources
 
 - Cerezo et al., *Cost function dependent barren plateaus in shallow parametrized
