@@ -91,7 +91,8 @@ RECOMMENDED (the frozen phase does the real work; fine-tuning adds ~nothing):
 """
 
 from __future__ import annotations
-
+from dotenv import load_dotenv
+load_dotenv()
 import os
 import random
 import datetime
