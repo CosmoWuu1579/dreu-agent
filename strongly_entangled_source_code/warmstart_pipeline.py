@@ -93,6 +93,7 @@ RECOMMENDED (the frozen phase does the real work; fine-tuning adds ~nothing):
 from __future__ import annotations
 
 import os
+import random
 import datetime
 
 import numpy as np
@@ -143,6 +144,10 @@ MIN_EPOCHS = int(os.environ.get("MIN_EPOCHS", "15"))
 FINETUNE_LR = float(os.environ.get("FINETUNE_LR", str(LR / 100)))
 BATCH = int(os.environ.get("BATCH", "32"))
 SEED = int(os.environ.get("SEED", "0"))
+# DETERMINISTIC: force cuDNN to pick reproducible conv algorithms. Off by default
+# cuDNN autotunes and picks NON-deterministic kernels, so two identical runs on
+# the same GPU can differ. Costs a little speed; worth it while ablating.
+DETERMINISTIC = os.environ.get("DETERMINISTIC", "1") != "0"
 # Mild geometric augmentation on the TRAIN split only. Overfitting is the binding
 # constraint on this task (train loss -> ~0.04 while val plateaus ~95%), and
 # augmentation is the paper's own recommended fix for it.
@@ -210,6 +215,32 @@ class BrainDataset(Dataset):
         return img, self.labels[idx]
 
 
+def set_seed(seed: int):
+    """Re-seed EVERY rng (python, numpy, torch cpu+cuda).
+
+    Call this immediately before building each model. Seeding once at startup is
+    NOT enough: model init draws from the global rng, so by the time the quantum
+    head is built the rng has already been consumed by the backbone's init AND by
+    every epoch of warm-up training (shuffling, augmentation, dropout). How much
+    it consumed depends on HOW MANY EPOCHS RAN -- which early stopping changes.
+    The quantum head is init-fragile (notes.md #4: seed decides 50% vs 97%), so
+    without re-seeding, changing WARMUP_EPOCHS silently re-rolls the quantum init
+    and every ablation (OBSERVABLES / REUPLOAD / VARIANT) is confounded.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    manual_seed(seed)                    # torch.manual_seed -- also seeds CUDA
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)   # explicit, for all visible devices
+
+
+def apply_determinism():
+    """Make cuDNN pick reproducible (rather than autotuned) conv algorithms."""
+    if DETERMINISTIC:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
 def build_transform(augment: bool):
     """Eval transform = the paper's exactly. The train transform optionally adds
     mild geometric augmentation (flip / +-10 deg / small shift+scale), applied to
@@ -235,7 +266,11 @@ def make_loaders(augment: bool = AUGMENT):
     if not os.path.isdir(eval_dir):
         eval_dir = os.path.join(SE_DATA_DIR, "test")
     ev = BrainDataset(eval_dir, build_transform(False))
-    return (DataLoader(train, batch_size=BATCH, shuffle=True),
+    # explicit generator: the shuffle order depends ONLY on SEED, not on however
+    # much of the global rng earlier phases happened to consume
+    g = torch.Generator()
+    g.manual_seed(SEED)
+    return (DataLoader(train, batch_size=BATCH, shuffle=True, generator=g),
             DataLoader(ev, batch_size=BATCH, shuffle=False))
 
 
@@ -629,7 +664,9 @@ def write_config(path, train_loader, eval_loader, qnn):
         f"FINETUNE_LR             = {FINETUNE_LR}",
         f"MIN_EPOCHS (grace)      = {MIN_EPOCHS}"
         + "  (no early-stop / no lr decay before this epoch)",
-        f"SEED                    = {SEED}",
+        f"SEED                    = {SEED}"
+        + "  (models re-seeded at build time: backbone=SEED, quantum head=SEED+1)",
+        f"DETERMINISTIC (cuDNN)   = {DETERMINISTIC}",
         "",
         "[env]",
         f"device                  = {device}",
@@ -643,7 +680,8 @@ def write_config(path, train_loader, eval_loader, qnn):
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    manual_seed(SEED); np.random.seed(SEED)
+    set_seed(SEED)
+    apply_determinism()
 
     # one folder per run: runs/<VARIANT>_<stamp>/ holds the training log + the
     # config snapshot that produced it
@@ -654,6 +692,10 @@ if __name__ == "__main__":
     config_path = os.path.join(run_dir, "config.txt")
 
     train_loader, eval_loader = make_loaders()
+    # SEED+1: the quantum head's init must NOT depend on how much rng the warm-up
+    # burned (which early stopping changes) -- otherwise every ablation is
+    # confounded by a silently re-rolled init. See set_seed().
+    set_seed(SEED + 1)
     qnn = create_qnn(VARIANT)                    # built early so config can log it
     write_config(config_path, train_loader, eval_loader, qnn)
     with open(log_path, "w", encoding="utf-8") as flog:
@@ -661,6 +703,7 @@ if __name__ == "__main__":
     print(f"run dir: {os.path.abspath(run_dir)}")
     print(f"variant={VARIANT}  device={device}  fast={FAST}  data={SE_DATA_DIR}")
 
+    set_seed(SEED)                               # backbone init: depends only on SEED
     backbone = Backbone().to(device)
     history = []                                 # every epoch, every phase -> plots
     best_cls = {"acc": -1.0, "tag": None, "epoch": None}   # best classical epoch
@@ -676,6 +719,10 @@ if __name__ == "__main__":
     # --- Phase 2: quantum ---
     print(f"\n=== Phase 2: quantum ({VARIANT}, qubits={qnn.num_inputs}) ===")
     ckpt = os.path.join(run_dir, "best_quantum.pt")
+    # Re-seed HERE, not just before create_qnn: create_qnn only builds the
+    # circuit, while the random init (TorchConnector's weights, fc2, fc3) happens
+    # when the head below is constructed -- i.e. AFTER warm-up has consumed rng.
+    set_seed(SEED + 1)
     if FAST:
         # freeze backbone, cache its features once, train the head on cached feats
         print("FAST: caching backbone features, training quantum head only")
@@ -687,7 +734,9 @@ if __name__ == "__main__":
         Ftr, ytr = cache_features(backbone, clean_train)
         Fte, yte = cache_features(backbone, eval_loader)
         head = QuantumHead(qnn).to(device)
-        tl = DataLoader(TensorDataset(Ftr, ytr), batch_size=BATCH, shuffle=True)
+        gq = torch.Generator(); gq.manual_seed(SEED)      # deterministic shuffle
+        tl = DataLoader(TensorDataset(Ftr, ytr), batch_size=BATCH, shuffle=True,
+                        generator=gq)
         el = DataLoader(TensorDataset(Fte, yte), batch_size=BATCH, shuffle=False)
         acc2, f1_2 = train_phase(head, tl, el, QUANTUM_EPOCHS, QUANTUM_LR, "q_cached",
                                  log_path, history, best=best_q, ckpt_path=ckpt)
