@@ -61,6 +61,11 @@ Knobs (env):
                    is the paper's own recommended fix. TRAIN split only; eval is
                    always the clean transform. No real effect under FAST (features
                    are cached once, so the augmentation cannot vary per epoch).
+    EARLY_STOP     1 -> stop a phase after PATIENCE epochs with no val improvement
+                   (default 1; PATIENCE default 8). Set EARLY_STOP=0 for old behaviour.
+    SCHEDULE       1 -> ReduceLROnPlateau on val acc (default 1), tuned by
+                   SCHEDULE_FACTOR (0.5) / SCHEDULE_PATIENCE (3). SCHEDULE=0 disables.
+                   Both toggles are independent.
     BATCH / SEED
 
 Each run writes runs/<VARIANT>_<stamp>/ containing training.txt (per-epoch log),
@@ -118,6 +123,19 @@ SEED = int(os.environ.get("SEED", "0"))
 # constraint on this task (train loss -> ~0.04 while val plateaus ~95%), and
 # augmentation is the paper's own recommended fix for it.
 AUGMENT = os.environ.get("AUGMENT", "1") != "0"
+
+# --- both of these are independently toggleable; set to 0 for the old behaviour ---
+# EARLY_STOP: halt a phase after PATIENCE epochs with no val improvement. The
+# frozen quantum phase peaks early (~ep 9) then DEGRADES for 30 more epochs --
+# wasting the most expensive epochs in the run.
+EARLY_STOP = os.environ.get("EARLY_STOP", "1") != "0"
+PATIENCE = int(os.environ.get("PATIENCE", "8"))
+# SCHEDULE: ReduceLROnPlateau -- halve the lr when val accuracy stalls. The tiny
+# quantum head (4 weights) oscillates at LR=1e-3 (val swinging 86<->97 while the
+# loss barely moves); decaying the lr lets it settle at its peak.
+SCHEDULE = os.environ.get("SCHEDULE", "1") != "0"
+SCHEDULE_FACTOR = float(os.environ.get("SCHEDULE_FACTOR", "0.5"))
+SCHEDULE_PATIENCE = int(os.environ.get("SCHEDULE_PATIENCE", "3"))
 
 
 # ---------------------------------------------------------------------------
@@ -319,9 +337,15 @@ def train_phase(model, train_loader, eval_loader, epochs, lr, tag, log_path,
                 NOT the best (val accuracy wanders while train loss keeps falling
                 -- overfitting), so this is the number worth reporting.
     ckpt_path : if given, the model's state_dict is saved whenever `best` improves.
+
+    Honors the EARLY_STOP / SCHEDULE toggles (both independently switchable).
     """
     opt = optim.NAdam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
     loss_fn = nn.CrossEntropyLoss()
+    sched = (optim.lr_scheduler.ReduceLROnPlateau(
+        opt, mode="max", factor=SCHEDULE_FACTOR, patience=SCHEDULE_PATIENCE)
+        if SCHEDULE else None)
+    phase_best, stale = -1.0, 0          # phase-local, drives early stopping
     for epoch in range(epochs):
         model.train()
         losses = []
@@ -336,16 +360,34 @@ def train_phase(model, train_loader, eval_loader, epochs, lr, tag, log_path,
         acc, _ = evaluate(model, eval_loader)
         if history is not None:
             history.append({"tag": tag, "epoch": epoch + 1, "loss": avg, "acc": acc})
+
         marker = ""
-        if best is not None and acc > best["acc"]:
+        if best is not None and acc > best["acc"]:      # global (cross-phase) best
             best.update(acc=acc, tag=tag, epoch=epoch + 1)
             if ckpt_path:
                 torch.save(model.state_dict(), ckpt_path)
             marker = "  <- best"
+
+        if sched is not None:                           # decay lr when val stalls
+            prev_lr = opt.param_groups[0]["lr"]
+            sched.step(acc)
+            new_lr = opt.param_groups[0]["lr"]
+            if new_lr < prev_lr:
+                marker += f"  (lr {prev_lr:.2g} -> {new_lr:.2g})"
+
         with open(log_path, "a", encoding="utf-8") as flog:
             flog.write(f"{tag}, {epoch + 1}, {avg:.4f}, {100 * acc:.2f}%\n")
         print(f"[{tag}] epoch {epoch + 1}/{epochs}: loss={avg:.4f}  "
               f"val_acc={100 * acc:.2f}%{marker}")
+
+        if acc > phase_best + 1e-9:
+            phase_best, stale = acc, 0
+        else:
+            stale += 1
+        if EARLY_STOP and PATIENCE > 0 and stale >= PATIENCE:
+            print(f"[{tag}] early stop: no val improvement in {PATIENCE} epochs "
+                  f"(phase best {100 * phase_best:.2f}%)")
+            break
     return evaluate(model, eval_loader)
 
 
@@ -454,6 +496,10 @@ def write_config(path, train_loader, eval_loader, qnn):
         f"BATCH                   = {BATCH}",
         f"AUGMENT (train only)    = {AUGMENT}"
         + ("  (no effect under FAST: features cached once)" if (AUGMENT and FAST) else ""),
+        f"EARLY_STOP / PATIENCE   = {EARLY_STOP} / {PATIENCE}",
+        f"SCHEDULE                = {SCHEDULE}"
+        + (f"  (ReduceLROnPlateau factor={SCHEDULE_FACTOR} patience={SCHEDULE_PATIENCE})"
+           if SCHEDULE else ""),
         "",
         "[training]",
         f"WARMUP_EPOCHS           = {WARMUP_EPOCHS}",
