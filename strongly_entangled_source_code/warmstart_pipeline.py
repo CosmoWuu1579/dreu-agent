@@ -137,6 +137,19 @@ SCHEDULE = os.environ.get("SCHEDULE", "1") != "0"
 SCHEDULE_FACTOR = float(os.environ.get("SCHEDULE_FACTOR", "0.5"))
 SCHEDULE_PATIENCE = int(os.environ.get("SCHEDULE_PATIENCE", "3"))
 
+# --- quantum-head capacity knobs. BOTH DEFAULT TO THE PAPER'S EXACT BEHAVIOUR ---
+# OBSERVABLES: what the head reads off the state. The paper reads ONE scalar,
+# which is the measured bottleneck (quantum train loss floors ~10x above the
+# classical head's). More observables cost nothing extra to simulate.
+#   single      -> [Z on last qubit]              1 output   (paper; DEFAULT)
+#   local       -> [Z on every qubit]             n outputs
+#   local_corr  -> local + [ZZ adjacent pairs]    n + (n-1) outputs
+OBSERVABLES = os.environ.get("OBSERVABLES", "single").strip().lower()
+# REUPLOAD: data re-uploading depth. 1 = encode once then one ansatz (paper;
+# DEFAULT). k>1 interleaves encode->ansatz k times, re-injecting x at every layer
+# -- the standard way to make a small VQC much more expressive.
+REUPLOAD = int(os.environ.get("REUPLOAD", "1"))
+
 
 # ---------------------------------------------------------------------------
 # Dataset (the paper's)
@@ -264,26 +277,73 @@ def _pool_layer(sources, sinks, prefix):
     return qc
 
 
-def create_qnn(variant: str) -> EstimatorQNN:
-    """Build the EstimatorQNN for a variant name like 'Q4E2'.
-    QxEy -> x = #qubits (2 or 4), y = encoder (1=product Z, 2=entangled ZZ)."""
-    v = variant.upper()
-    n = int(v[1])                                  # Q2.. -> 2, Q4.. -> 4
-    fmap = z_feature_map(n) if v.endswith("1") else zz_feature_map(n)
+def _pauli(n: int, spec: dict) -> str:
+    """Pauli string for {qubit: 'Z'}. Qiskit puts the HIGHEST qubit leftmost, so
+    n=2, {0:'Z'} -> 'IZ' (Z on qubit 0); {1:'Z'} -> 'ZI'."""
+    s = ["I"] * n
+    for q, p in spec.items():
+        s[n - 1 - q] = p
+    return "".join(s)
+
+
+def build_observables(n: int, mode: str):
+    """What the head reads off the state (see the OBSERVABLES knob).
+    mode='single' reproduces the paper exactly: Z on the last qubit."""
+    mode = (mode or "single").lower()
+    if mode == "single":
+        return [SparsePauliOp.from_list([(_pauli(n, {n - 1: "Z"}), 1)])]
+    if mode not in ("local", "local_corr"):
+        raise ValueError(f"OBSERVABLES must be single|local|local_corr, got {mode!r}")
+    obs = [SparsePauliOp.from_list([(_pauli(n, {q: "Z"}), 1)]) for q in range(n)]
+    if mode == "local_corr":
+        obs += [SparsePauliOp.from_list([(_pauli(n, {q: "Z", q + 1: "Z"}), 1)])
+                for q in range(n - 1)]
+    return obs
+
+
+def build_ansatz(n: int, prefix: str) -> QuantumCircuit:
+    """The trainable block. `prefix` keeps weights unique per re-upload layer."""
     if n == 2:                                      # simple RealAmplitudes VQC
-        ansatz = real_amplitudes(2, reps=1)
-    else:                                           # paper's conv/pool ansatz (Q4)
-        ansatz = QuantumCircuit(n, name="Ansatz")
-        ansatz.compose(_conv_layer(4, "c1"), list(range(4)), inplace=True)
-        ansatz.compose(_pool_layer([0, 1], [2, 3], "p1"), list(range(4)), inplace=True)
-        ansatz.compose(_conv_layer(2, "c2"), list(range(2, 4)), inplace=True)
-        ansatz.compose(_pool_layer([0], [1], "p2"), list(range(2, 4)), inplace=True)
+        return real_amplitudes(2, reps=1, parameter_prefix=prefix)
+    a = QuantumCircuit(n, name="Ansatz")            # paper's conv/pool ansatz (Q4)
+    a.compose(_conv_layer(4, f"{prefix}c1"), list(range(4)), inplace=True)
+    a.compose(_pool_layer([0, 1], [2, 3], f"{prefix}p1"), list(range(4)), inplace=True)
+    a.compose(_conv_layer(2, f"{prefix}c2"), list(range(2, 4)), inplace=True)
+    a.compose(_pool_layer([0], [1], f"{prefix}p2"), list(range(2, 4)), inplace=True)
+    return a
+
+
+def create_qnn(variant: str, obs_mode: str = None, reupload: int = None) -> EstimatorQNN:
+    """Build the EstimatorQNN for a variant name like 'Q4E2'.
+    QxEy -> x = #qubits (2 or 4), y = encoder (1=product Z, 2=entangled ZZ).
+
+    With the defaults (OBSERVABLES='single', REUPLOAD=1) this builds EXACTLY the
+    paper's circuit: encode once -> one ansatz -> read one Z. The knobs only add
+    structure on top.
+
+    reupload > 1 = DATA RE-UPLOADING: the SAME feature-map object is composed
+    again between trainable blocks (encode -> ansatz -> encode -> ansatz ...), so
+    the same input Parameters are re-injected at every layer (that is what makes
+    it re-uploading rather than new inputs); each layer gets its own weights.
+    """
+    obs_mode = OBSERVABLES if obs_mode is None else obs_mode
+    reupload = REUPLOAD if reupload is None else reupload
+    v = variant.upper()
+    n = int(v[1])                                   # Q2.. -> 2, Q4.. -> 4
+    fmap = z_feature_map(n) if v.endswith("1") else zz_feature_map(n)  # built ONCE
+
     qc = QuantumCircuit(n)
-    qc.compose(fmap, range(n), inplace=True)
-    qc.compose(ansatz, range(n), inplace=True)
-    obs = SparsePauliOp.from_list([("Z" + "I" * (n - 1), 1)])   # single-qubit (local) Z
-    return EstimatorQNN(circuit=qc.decompose(), observables=obs,
-                        input_params=fmap.parameters, weight_params=ansatz.parameters,
+    weight_params = []
+    for layer in range(max(1, reupload)):
+        qc.compose(fmap, range(n), inplace=True)    # same Parameters -> re-upload
+        ansatz = build_ansatz(n, prefix=f"w{layer}_")
+        qc.compose(ansatz, range(n), inplace=True)
+        weight_params += list(ansatz.parameters)
+
+    return EstimatorQNN(circuit=qc.decompose(),
+                        observables=build_observables(n, obs_mode),
+                        input_params=list(fmap.parameters),
+                        weight_params=weight_params,
                         input_gradients=True)
 
 
@@ -293,7 +353,10 @@ class QuantumHead(nn.Module):
         super().__init__()
         self.fc2 = nn.Linear(512, qnn.num_inputs)   # 512 -> 2 or 4, per variant
         self.qnn = TorchConnector(qnn)
-        self.fc3 = nn.Linear(1, 1)
+        # sized to the number of observables: 1 with the paper's default, more
+        # when OBSERVABLES=local/local_corr widens the readout
+        n_out = int(np.atleast_1d(qnn.output_shape)[0])
+        self.fc3 = nn.Linear(n_out, 1)
 
     def forward(self, feats):                        # feats = 512-d backbone output
         x = self.fc3(self.qnn(self.fc2(feats)))
@@ -483,6 +546,11 @@ def write_config(path, train_loader, eval_loader, qnn):
         f"VARIANT                 = {VARIANT}",
         f"qubits (qnn.num_inputs) = {n}",
         f"quantum weights (#Para) = {qnn.num_weights}",
+        f"OBSERVABLES             = {OBSERVABLES}  "
+        f"({int(np.atleast_1d(qnn.output_shape)[0])} readout(s))",
+        f"REUPLOAD                = {REUPLOAD}"
+        + ("  (paper default: encode once)" if REUPLOAD <= 1 else
+           f"  (encoder re-applied {REUPLOAD}x)"),
         f"encoder                 = " + ("z_feature_map (E1, product, no entanglement)"
                                          if VARIANT.endswith("1") else
                                          "zz_feature_map (E2, pairwise-entangled)"),
