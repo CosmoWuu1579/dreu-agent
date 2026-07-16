@@ -51,10 +51,18 @@ Knobs (env):
     FREEZE_EPOCHS  freeze backbone for first N Phase-2 epochs (default 10;
                    ignored in FAST mode, where the backbone is always frozen)
     FAST           1 -> cache features, train head only (fast)   (default 0)
-    LR             training lr for Phase 1 + the frozen head     (default 1e-3)
+    LR             lr for the CLASSICAL warm-up                  (default 1e-3)
+    QUANTUM_LR     lr for the quantum phases                     (default 3e-4)
+                   -- separate because the 4-weight head oscillates at 1e-3 while
+                      the 4.3M-param CNN warms up worse below 1e-3.
     FINETUNE_LR    lr used AFTER unfreezing the backbone         (default LR/100)
                    -- at the full LR the unfreeze causes catastrophic forgetting
                       (89% -> 51% in 2 epochs; notes.md #6). Not used in FAST.
+    MIN_EPOCHS     grace period: no early stop AND no lr decay before this epoch
+                   (default 15). The quantum head sits at exactly 50% for ~7
+                   epochs before escaping (notes.md #6); without this, early stop
+                   kills the phase mid-plateau and the scheduler decays the lr,
+                   making the escape harder. 0 disables.
     AUGMENT        1 -> mild train-time augmentation (flip / +-10deg / shift+scale)
                    (default 1). Overfitting is the binding constraint here
                    (train loss -> 0.04 while val plateaus ~95%), and augmentation
@@ -66,6 +74,11 @@ Knobs (env):
     SCHEDULE       1 -> ReduceLROnPlateau on val acc (default 1), tuned by
                    SCHEDULE_FACTOR (0.5) / SCHEDULE_PATIENCE (3). SCHEDULE=0 disables.
                    Both toggles are independent.
+    RESTORE_BEST   1 -> each phase ends by rolling back to its BEST val epoch, so
+                   the next phase inherits the best weights (the quantum phase gets
+                   the best warm-up backbone, not whatever the last epoch left).
+                   Matters most with EARLY_STOP, which runs PATIENCE epochs past
+                   the best. Default 1; RESTORE_BEST=0 = old last-epoch handover.
     BATCH / SEED
 
 Each run writes runs/<VARIANT>_<stamp>/ containing training.txt (per-epoch log),
@@ -113,6 +126,17 @@ QUANTUM_EPOCHS = int(os.environ.get("QUANTUM_EPOCHS", "40"))
 FREEZE_EPOCHS = int(os.environ.get("FREEZE_EPOCHS", "10"))
 FAST = os.environ.get("FAST", "0") != "0"
 LR = float(os.environ.get("LR", "0.001"))
+# The quantum head (4 weights) and the CNN (4.3M params) do NOT want the same lr:
+# 1e-3 makes the head oscillate, but dropping LR to 3e-4 slows the warm-up (98.0%
+# vs 99.5%). So they get their own. LR = classical warm-up; QUANTUM_LR = quantum
+# phases (q_frozen / q_cached).
+QUANTUM_LR = float(os.environ.get("QUANTUM_LR", "0.0003"))
+# GRACE PERIOD: neither early stopping nor lr decay may fire before this epoch.
+# The quantum head sits at EXACTLY 50% for the first ~7 epochs (the cat((x,1-x))
+# init bias -- notes.md #6) and only then escapes. Without a grace period, both
+# features misread that expected plateau: early stop kills the phase at ep 9, and
+# the scheduler decays the lr, making the escape even harder. 0 disables.
+MIN_EPOCHS = int(os.environ.get("MIN_EPOCHS", "15"))
 # Fine-tuning a CONVERGED backbone must use a much smaller lr than training it
 # from scratch: at the same lr, unfreezing wrecks the learned features in ~2
 # epochs (catastrophic forgetting -- measured, see notes.md evidence #6).
@@ -149,6 +173,13 @@ OBSERVABLES = os.environ.get("OBSERVABLES", "single").strip().lower()
 # DEFAULT). k>1 interleaves encode->ansatz k times, re-injecting x at every layer
 # -- the standard way to make a small VQC much more expressive.
 REUPLOAD = int(os.environ.get("REUPLOAD", "1"))
+# RESTORE_BEST: at the END of each phase, roll the model back to the weights from
+# that phase's BEST val epoch, so the next phase starts from the best state rather
+# than whatever the last epoch happened to leave. Matters most with EARLY_STOP on,
+# which deliberately runs PATIENCE epochs PAST the best before halting. Chain:
+# warm-up ends at its best -> the quantum phase inherits the best backbone.
+# 0 = old behaviour (each phase hands over its LAST epoch).
+RESTORE_BEST = os.environ.get("RESTORE_BEST", "1") != "0"
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +440,7 @@ def train_phase(model, train_loader, eval_loader, epochs, lr, tag, log_path,
         opt, mode="max", factor=SCHEDULE_FACTOR, patience=SCHEDULE_PATIENCE)
         if SCHEDULE else None)
     phase_best, stale = -1.0, 0          # phase-local, drives early stopping
+    best_state = None                   # weights at this phase's best epoch
     for epoch in range(epochs):
         model.train()
         losses = []
@@ -431,7 +463,12 @@ def train_phase(model, train_loader, eval_loader, epochs, lr, tag, log_path,
                 torch.save(model.state_dict(), ckpt_path)
             marker = "  <- best"
 
-        if sched is not None:                           # decay lr when val stalls
+        # GRACE: during the first MIN_EPOCHS, do not decay the lr and do not allow
+        # an early stop -- the quantum head's opening 50% plateau is expected and
+        # temporary, and both features would misread it as "converged".
+        in_grace = (epoch + 1) < MIN_EPOCHS
+
+        if sched is not None and not in_grace:          # decay lr when val stalls
             prev_lr = opt.param_groups[0]["lr"]
             sched.step(acc)
             new_lr = opt.param_groups[0]["lr"]
@@ -445,12 +482,22 @@ def train_phase(model, train_loader, eval_loader, epochs, lr, tag, log_path,
 
         if acc > phase_best + 1e-9:
             phase_best, stale = acc, 0
+            if RESTORE_BEST:        # snapshot the weights at this phase's best
+                best_state = {k: v.detach().cpu().clone()
+                              for k, v in model.state_dict().items()}
         else:
             stale += 1
-        if EARLY_STOP and PATIENCE > 0 and stale >= PATIENCE:
-            print(f"[{tag}] early stop: no val improvement in {PATIENCE} epochs "
-                  f"(phase best {100 * phase_best:.2f}%)")
+        if EARLY_STOP and PATIENCE > 0 and stale >= PATIENCE and not in_grace:
+            print(f"[{tag}] early stop at epoch {epoch + 1}: no val improvement in "
+                  f"{PATIENCE} epochs (phase best {100 * phase_best:.2f}%)")
             break
+
+    # Hand the NEXT phase this phase's BEST weights rather than its last ones.
+    # `model` shares the Backbone object, so restoring here also rolls the
+    # backbone back -- which is how the quantum phase inherits the best warm-up.
+    if RESTORE_BEST and best_state is not None:
+        model.load_state_dict(best_state)
+        print(f"[{tag}] restored best weights (val {100 * phase_best:.2f}%)")
     return evaluate(model, eval_loader)
 
 
@@ -565,6 +612,9 @@ def write_config(path, train_loader, eval_loader, qnn):
         f"AUGMENT (train only)    = {AUGMENT}"
         + ("  (no effect under FAST: features cached once)" if (AUGMENT and FAST) else ""),
         f"EARLY_STOP / PATIENCE   = {EARLY_STOP} / {PATIENCE}",
+        f"RESTORE_BEST            = {RESTORE_BEST}"
+        + ("  (each phase hands over its BEST weights)" if RESTORE_BEST else
+           "  (each phase hands over its LAST weights)"),
         f"SCHEDULE                = {SCHEDULE}"
         + (f"  (ReduceLROnPlateau factor={SCHEDULE_FACTOR} patience={SCHEDULE_PATIENCE})"
            if SCHEDULE else ""),
@@ -574,8 +624,11 @@ def write_config(path, train_loader, eval_loader, qnn):
         f"FREEZE_EPOCHS           = {FREEZE_EPOCHS}",
         f"QUANTUM_EPOCHS          = {QUANTUM_EPOCHS}",
         f"FAST                    = {FAST}",
-        f"LR                      = {LR}",
+        f"LR (classical warm-up)  = {LR}",
+        f"QUANTUM_LR              = {QUANTUM_LR}",
         f"FINETUNE_LR             = {FINETUNE_LR}",
+        f"MIN_EPOCHS (grace)      = {MIN_EPOCHS}"
+        + "  (no early-stop / no lr decay before this epoch)",
         f"SEED                    = {SEED}",
         "",
         "[env]",
@@ -636,15 +689,16 @@ if __name__ == "__main__":
         head = QuantumHead(qnn).to(device)
         tl = DataLoader(TensorDataset(Ftr, ytr), batch_size=BATCH, shuffle=True)
         el = DataLoader(TensorDataset(Fte, yte), batch_size=BATCH, shuffle=False)
-        acc2, f1_2 = train_phase(head, tl, el, QUANTUM_EPOCHS, LR, "q_cached",
+        acc2, f1_2 = train_phase(head, tl, el, QUANTUM_EPOCHS, QUANTUM_LR, "q_cached",
                                  log_path, history, best=best_q, ckpt_path=ckpt)
     else:
         qnet = QuantumNet(backbone, qnn).to(device)
         if FREEZE_EPOCHS > 0:
-            print(f"freezing backbone for the first {FREEZE_EPOCHS} epochs (lr={LR})")
+            print(f"freezing backbone for the first {FREEZE_EPOCHS} epochs "
+                  f"(lr={QUANTUM_LR})")
             set_backbone_trainable(qnet, False)
-            train_phase(qnet, train_loader, eval_loader, FREEZE_EPOCHS, LR, "q_frozen",
-                        log_path, history, best=best_q, ckpt_path=ckpt)
+            train_phase(qnet, train_loader, eval_loader, FREEZE_EPOCHS, QUANTUM_LR,
+                        "q_frozen", log_path, history, best=best_q, ckpt_path=ckpt)
             set_backbone_trainable(qnet, True)
         # unfreeze at a MUCH lower lr -- at the full lr this destroys the warm
         # backbone in ~2 epochs (see notes.md #6)

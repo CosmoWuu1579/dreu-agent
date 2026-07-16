@@ -131,6 +131,51 @@ the head.
 Secondary safety net: even warm-started, VQC init has some variance, so a 2–3
 seed retry (keep the run that moves off 50% by ~epoch 10) is cheap insurance.
 
+## Next: wiring this into the LLM agent pipeline
+
+**Why this work is the missing piece.** The DREU project is an LLM agent that
+designs quantum circuits. Until now it had no rigorous task to design *against*.
+This gives it one: a real medical-imaging benchmark with a measured baseline
+(classical **99.5%**), a measured quantum result (**97.5%**), a **2-point gap**,
+and a mechanism hypothesis (readout capacity: quantum train loss floors at ~0.27
+vs the classical head's ~0.03). The agent's job becomes concrete and falsifiable:
+**close that gap.**
+
+**Design space the agent can search** (all exposed as knobs in
+`warmstart_pipeline.py`, so the seeds are real and runnable):
+encoder E1/E2 (product vs entangled) x ansatz (RealAmplitudes / conv-pool) x
+`OBSERVABLES` (readout width: single / local / local_corr) x `REUPLOAD` (data
+re-uploading depth) x qubit count. A grid over these is only ~12 configs -- an
+LLM adds nothing to grid search. The value is letting it **write circuits**
+(`create_qnn(n) -> EstimatorQNN`) that go beyond the grid.
+
+**Plan (4 pieces):**
+
+1. **Freeze a reusable backbone (one-time).** Run the warm-up once; save
+   `backbone.pt` and dump its 512-d features to `features_{train,val}.npy`. Every
+   agent evaluation reuses them: no images, no CNN, no re-warm-up. This is what
+   makes an agent loop viable -- and it is why the frozen-feature idea works now
+   but did not before: the features come from a 99.5% backbone, not a random CNN.
+
+2. **Evaluator** `qcnn_head_eval.py`: load cached features -> exec the agent's
+   `create_qnn(n)` -> wrap in `QuantumHead` -> train ~15 epochs -> return
+   `{ok, accuracy (BEST, not last), n_weights, n_readouts, depth}`.
+   SPEED: quantum cost is linear in samples, so **subsample to ~400 features for
+   the search** (seconds/candidate) and re-validate finalists on the full set.
+
+3. **Task** `qcnn_head_task.py` (mirrors `qml_task.py`): `entry_point="create_qnn"`,
+   `target_metric="accuracy"`, `target_value=0.995` (the classical ceiling).
+   Seeds = the paper's Q2E2 + the `local_corr` and `REUPLOAD=3` variants. The
+   prompt states the real problem: *beat 97.5%; classical is 99.5%; the measured
+   bottleneck is readout capacity -- widen it.*
+
+4. **Runner** -> `AgentPipeline`, mirroring `run_discovery.py`.
+
+**Caveats to design around:**
+- SGD init-fragility (#4) makes scoring noisy: fix the seed, report the BEST
+  epoch (not the last), and average 2 seeds for finalists.
+- Report the agent's winner on a held-out split, not the one used for selection.
+
 ## Sources
 
 - Cerezo et al., *Cost function dependent barren plateaus in shallow parametrized
