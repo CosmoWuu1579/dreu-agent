@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import os
 import csv
+import time
 import datetime
 import statistics
 
@@ -99,14 +100,48 @@ def _paper_circuit(variant):
 
 
 # ---------------------------------------------------------------------------
+# Live progress log -- mirrors warmstart_pipeline's training.txt so you can watch
+# progress and, above all, TIME each epoch / phase / seed / the whole run. Set in
+# __main__ once the run folder exists; before that it's a no-op (safe for tests /
+# importing the module). Every _train epoch appends a row here in real time.
+# ---------------------------------------------------------------------------
+PROGRESS_LOG = None
+RUN_START = time.time()          # wall clock at import; reset in __main__
+
+
+def _since_start():
+    """Total elapsed since the run began -- stamped on every epoch so you can
+    always see how long the whole job has been going, not just this phase."""
+    return _fmt(time.time() - RUN_START)
+
+
+def _log(line):
+    """Append one line to the progress log (if a run folder is set) AND print it,
+    so the same per-epoch/phase/timing trace goes to the console and to disk."""
+    print(line)
+    if PROGRESS_LOG is not None:
+        with open(PROGRESS_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+
+def _fmt(secs):
+    """Human-friendly duration: '4.2s' or '1m 03s'."""
+    return f"{secs:.1f}s" if secs < 60 else f"{int(secs // 60)}m {secs % 60:04.1f}s"
+
+
+# ---------------------------------------------------------------------------
 # Clean fixed-epoch training loop -> (best val acc, [(train_loss, val_acc), ...]).
 # No lr decay, no early stop -- runs every epoch so curves are full + averageable.
 # ---------------------------------------------------------------------------
-def _train(model, train_loader, eval_loader, epochs, lr, restore_best=False):
+def _train(model, train_loader, eval_loader, epochs, lr, restore_best=False, tag=""):
+    """Clean fixed-epoch loop. Logs (and times) every epoch via _log so runtime is
+    trackable live; returns (best val acc, [(train_loss, val_acc), ...])."""
     opt = optim.NAdam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
     loss_fn = nn.CrossEntropyLoss()
     best, curve, best_state = -1.0, [], None
-    for _ in range(epochs):
+    phase_t0 = time.time()
+    for epoch in range(epochs):
+        ep_t0 = time.time()
         model.train()
         losses = []
         for xb, yb in train_loader:
@@ -119,15 +154,22 @@ def _train(model, train_loader, eval_loader, epochs, lr, restore_best=False):
         avg = sum(losses) / max(len(losses), 1)
         acc, _ = wp.evaluate(model, eval_loader)
         curve.append((avg, acc))
+        marker = ""
         if acc > best:
             best = acc
+            marker = "  <- best"
             if restore_best:                     # snapshot best-val weights
                 best_state = {k: v.detach().cpu().clone()
                               for k, v in model.state_dict().items()}
+        _log(f"[{tag}] epoch {epoch + 1}/{epochs}: loss={avg:.4f}  "
+             f"val_acc={100 * acc:.2f}%  ({_fmt(time.time() - ep_t0)})  "
+             f"[total +{_since_start()}]{marker}")
     # roll back to the best epoch, so the NEXT phase inherits the best weights
     # (this changes the handed-over model, NOT the recorded curve or epoch count)
     if restore_best and best_state is not None:
         model.load_state_dict(best_state)
+    _log(f"[{tag}] phase done: {epochs} epochs in {_fmt(time.time() - phase_t0)}  "
+         f"(best {100 * best:.2f}%)")
     return best, curve
 
 
@@ -143,7 +185,8 @@ def run_original(seed, variant):
     # single phase, so restore_best only sets the final weights (best is reported
     # either way); kept for consistency
     best, curve = _train(model, train_loader, eval_loader, ORIG_EPOCHS, ORIG_LR,
-                         restore_best=CMP_RESTORE_BEST)
+                         restore_best=CMP_RESTORE_BEST,
+                         tag=f"{variant}/orig/s{seed}/scratch")
     return {"best": best, "phases": [("original", curve)]}
 
 
@@ -156,7 +199,8 @@ def run_warmstart(seed, variant):
     # phase 1: restore_best -> the frozen phase inherits the BEST warm-up backbone
     _, warm = _train(wp.ClassicalNet(backbone).to(wp.device),        # phase 1
                      train_loader, eval_loader, WARM_EPOCHS, WARM_LR,
-                     restore_best=CMP_RESTORE_BEST)
+                     restore_best=CMP_RESTORE_BEST,
+                     tag=f"{variant}/warm/s{seed}/warmup")
 
     wp.set_seed(seed + 1)                                            # head init
     qnet = wp.QuantumNet(backbone, _paper_circuit(variant)).to(wp.device)
@@ -164,11 +208,13 @@ def run_warmstart(seed, variant):
     # phase 2: restore_best -> fine-tune inherits the BEST frozen head (the frozen
     # phase oscillates, so its last epoch is often NOT its best)
     best_fr, frozen = _train(qnet, train_loader, eval_loader, FREEZE_EPOCHS, FROZEN_LR,
-                             restore_best=CMP_RESTORE_BEST)
+                             restore_best=CMP_RESTORE_BEST,
+                             tag=f"{variant}/warm/s{seed}/frozen")
 
     wp.set_backbone_trainable(qnet, True)                           # phase 3: unfreeze
     best_ft, fine = _train(qnet, train_loader, eval_loader, FINETUNE_EPOCHS, FT_LR,
-                           restore_best=CMP_RESTORE_BEST)
+                           restore_best=CMP_RESTORE_BEST,
+                           tag=f"{variant}/warm/s{seed}/finetune")
 
     # "best" is over the QUANTUM phases (frozen + fine-tune); warm-up is classical
     return {"best": max(best_fr, best_ft),
@@ -183,20 +229,24 @@ METHOD_FNS = {"original": run_original, "warmstart": run_warmstart}
 # ---------------------------------------------------------------------------
 def run_all():
     results = {}
+    run_t0 = time.time()
     for variant in CMP_VARIANTS:
         results[variant] = {}
         for m in METHODS:
             if m not in METHOD_FNS:
-                print(f"  (skipping unknown method {m!r})"); continue
-            print(f"\n=== {variant} / {m} ===")
+                _log(f"  (skipping unknown method {m!r})"); continue
+            _log(f"\n=== {variant} / {m} ===")
             rows = []
             for s in SEEDS:
+                seed_t0 = time.time()
                 r = METHOD_FNS[m](s, variant)
                 escaped = r["best"] >= ESCAPE_THRESHOLD
                 rows.append((s, r["best"], escaped, r["phases"]))
-                print(f"  seed={s}: best={100 * r['best']:5.2f}%  "
-                      f"{'escaped' if escaped else 'STUCK ~50%'}")
+                _log(f"  >> {variant}/{m} seed={s}: best={100 * r['best']:5.2f}%  "
+                     f"{'escaped' if escaped else 'STUCK ~50%'}  "
+                     f"[seed took {_fmt(time.time() - seed_t0)}, total +{_since_start()}]")
             results[variant][m] = rows
+    _log(f"\n[all runs finished in {_fmt(time.time() - run_t0)}]")
     return results
 
 
@@ -315,9 +365,16 @@ def plot_combined(variant, per_method, out_dir):
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     wp.apply_determinism()
+    RUN_START = time.time()          # start the elapsed-time clock at the real start
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join("runs", f"compare_{stamp}")
     os.makedirs(out_dir, exist_ok=True)
+
+    # from here on, _log() also appends the live per-epoch/phase/timing trace to
+    # progress.txt inside the run folder (mirrors warmstart_pipeline's training.txt)
+    PROGRESS_LOG = os.path.join(out_dir, "progress.txt")
+    with open(PROGRESS_LOG, "w", encoding="utf-8") as f:
+        f.write(f"# baseline_compare live log -- {datetime.datetime.now():%Y-%m-%d %H:%M:%S}\n")
 
     header = (f"variants={CMP_VARIANTS}  methods={METHODS}  seeds={SEEDS}  "
               f"device={wp.device}\n"
@@ -326,7 +383,7 @@ if __name__ == "__main__":
               f"| finetune {FINETUNE_EPOCHS}@{FT_LR}  (aug={wp.AUGMENT})\n"
               f"restore_best between phases = {CMP_RESTORE_BEST}  |  "
               f"circuit PINNED to paper's (single observable, reupload=1) for both")
-    print(header)
+    _log(header)
 
     results = run_all()
 

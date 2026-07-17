@@ -94,6 +94,7 @@ from __future__ import annotations
 from dotenv import load_dotenv
 load_dotenv()
 import os
+import time
 import random
 import datetime
 
@@ -120,6 +121,19 @@ from qiskit_machine_learning.connectors import TorchConnector
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# --- elapsed-time tracking: wall clock at import, reset at the start of __main__ ---
+RUN_START = time.time()
+
+
+def _fmt_secs(secs):
+    """Human-friendly duration: '4.2s' or '1m 03s'."""
+    return f"{secs:.1f}s" if secs < 60 else f"{int(secs // 60)}m {secs % 60:04.1f}s"
+
+
+def _since_start():
+    """Total elapsed since the run began (so every epoch shows cumulative time)."""
+    return _fmt_secs(time.time() - RUN_START)
 
 VARIANT = os.environ.get("VARIANT", "Q2E2").upper()
 SE_DATA_DIR = os.environ.get("SE_DATA_DIR", "./data/Br35H")
@@ -407,7 +421,12 @@ def create_qnn(variant: str, obs_mode: str = None, reupload: int = None) -> Esti
         qc.compose(ansatz, range(n), inplace=True)
         weight_params += list(ansatz.parameters)
 
-    return EstimatorQNN(circuit=qc.decompose(),
+    # Pass the circuit AS-IS -- do NOT call qc.decompose(). Decomposing produces a
+    # numerically identical circuit (same fully-unrolled gates, same outputs) but a
+    # gate-level representation the parameter-shift gradient is ~2.6x SLOWER to walk
+    # on Q2 and pathologically slower on Q4 (one backward pass would not finish).
+    # The paper (CNN-Q2E2.py) passes the raw circuit; matching it is the fast path.
+    return EstimatorQNN(circuit=qc,
                         observables=build_observables(n, obs_mode),
                         input_params=list(fmap.parameters),
                         weight_params=weight_params,
@@ -477,7 +496,9 @@ def train_phase(model, train_loader, eval_loader, epochs, lr, tag, log_path,
         if SCHEDULE else None)
     phase_best, stale = -1.0, 0          # phase-local, drives early stopping
     best_state = None                   # weights at this phase's best epoch
+    phase_t0 = time.time()
     for epoch in range(epochs):
+        ep_t0 = time.time()
         model.train()
         losses = []
         for xb, yb in train_loader:
@@ -511,10 +532,13 @@ def train_phase(model, train_loader, eval_loader, epochs, lr, tag, log_path,
             if new_lr < prev_lr:
                 marker += f"  (lr {prev_lr:.2g} -> {new_lr:.2g})"
 
+        ep_secs = time.time() - ep_t0
         with open(log_path, "a", encoding="utf-8") as flog:
-            flog.write(f"{tag}, {epoch + 1}, {avg:.4f}, {100 * acc:.2f}%\n")
+            flog.write(f"{tag}, {epoch + 1}, {avg:.4f}, {100 * acc:.2f}%, "
+                       f"{ep_secs:.1f}s, {_since_start()}\n")
         print(f"[{tag}] epoch {epoch + 1}/{epochs}: loss={avg:.4f}  "
-              f"val_acc={100 * acc:.2f}%{marker}")
+              f"val_acc={100 * acc:.2f}%  ({_fmt_secs(ep_secs)})  "
+              f"[total +{_since_start()}]{marker}")
 
         if acc > phase_best + 1e-9:
             phase_best, stale = acc, 0
@@ -534,6 +558,8 @@ def train_phase(model, train_loader, eval_loader, epochs, lr, tag, log_path,
     if RESTORE_BEST and best_state is not None:
         model.load_state_dict(best_state)
         print(f"[{tag}] restored best weights (val {100 * phase_best:.2f}%)")
+    print(f"[{tag}] phase done in {_fmt_secs(time.time() - phase_t0)}  "
+          f"(best {100 * phase_best:.2f}%)  [total +{_since_start()}]")
     return evaluate(model, eval_loader)
 
 
@@ -681,6 +707,7 @@ def write_config(path, train_loader, eval_loader, qnn):
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    RUN_START = time.time()          # start the elapsed-time clock at the real start
     set_seed(SEED)
     apply_determinism()
 
@@ -700,7 +727,7 @@ if __name__ == "__main__":
     qnn = create_qnn(VARIANT)                    # built early so config can log it
     write_config(config_path, train_loader, eval_loader, qnn)
     with open(log_path, "w", encoding="utf-8") as flog:
-        flog.write("phase, epoch, train_loss, val_accuracy(%)\n")
+        flog.write("phase, epoch, train_loss, val_accuracy(%), epoch_secs, elapsed_total\n")
     print(f"run dir: {os.path.abspath(run_dir)}")
     print(f"variant={VARIANT}  device={device}  fast={FAST}  data={SE_DATA_DIR}")
 
@@ -779,6 +806,7 @@ if __name__ == "__main__":
 
     print("\n" + "=" * 60)
     print(summary.lstrip("# "))
+    print(f"total wall-clock time: {_since_start()}")
     print(f"run dir: {os.path.abspath(run_dir)}")
     print(f"  training.txt      (per-epoch log)")
     print(f"  config.txt        (settings + results)")
