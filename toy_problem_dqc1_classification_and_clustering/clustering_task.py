@@ -1,6 +1,6 @@
 """
 Concrete DiscoveryTask for DQC1 entropy-based clustering (mirrors the role of
-qml_task.py + eval_harness.py, but for the unsupervised pipeline of dqc1.py /
+classification_task.py + eval_harness.py, but for the unsupervised pipeline of dqc1.py /
 "Unsupervised Quantum Machine Learning using One Clean Qubit").
 
 The candidate artifact is the quantum FEATURE MAP used inside the DQC1
@@ -62,6 +62,7 @@ import dqc1
 from dqc1 import (DQC1EntropyCluster, toy_sets, eval_scores,
                   labels_from_clusters, zero_mean_to_unit_interval)
 from eval_harness import compile_feature_map
+import _bootstrap  # noqa: F401  (adds parent dreu-agent/ dir to sys.path)
 from DiscoveryTask import DiscoveryTask
 
 CLUSTER_DATASETS = os.environ.get("CLUSTER_DATASETS", "spirals")
@@ -830,7 +831,7 @@ def make_clustering_task(datasets: str = CLUSTER_DATASETS,
     def _evaluate(code: str, *args, **kwargs) -> dict:
         # figures live in the task's per-run folder, next to the transcript
         # (`task` is bound below, before the first evaluation runs); plots/
-        # subfolder matches qml_task.py's convention
+        # subfolder matches classification_task.py's convention
         kwargs.setdefault("plot_dir", os.path.join(task.run_dir, "plots"))
         # enforce the hard resource budget ONLY when minimize_resources is on
         if minimize_resources:

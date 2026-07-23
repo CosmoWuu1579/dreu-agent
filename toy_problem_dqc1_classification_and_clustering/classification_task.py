@@ -20,8 +20,8 @@ loads .env itself):
                             Unset / 0 = no limit for that resource.
 
 Refresh the seed baselines after changing dim/kernel/data:
-    python qml_task.py baselines     # per-seed figures + paste-ready stats
-    python qml_task.py classical     # classical-SVM references only (fast)
+    python classification_task.py baselines   # per-seed figures + paste-ready stats
+    python classification_task.py classical   # classical-SVM references only (fast)
 """
 
 from __future__ import annotations
@@ -31,10 +31,11 @@ import sys
 import datetime
 
 # Honor .env even when THIS module is the entry point (e.g.
-# `python qml_task.py baselines`) -- otherwise only run_discovery.py loads it
-# and a direct run silently uses defaults. Must precede the env reads below.
-# load_dotenv does NOT override already-set vars, so it is a no-op when
-# run_discovery.py already called it.
+# `python classification_task.py baselines`) -- otherwise only
+# run_discovery_classification.py loads it and a direct run silently uses
+# defaults. Must precede the env reads below. load_dotenv does NOT override
+# already-set vars, so it is a no-op when run_discovery_classification.py
+# already called it.
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -49,6 +50,7 @@ import matplotlib.pyplot as plt
 from sklearn import svm
 from sklearn.metrics import accuracy_score
 
+import _bootstrap  # noqa: F401  (adds parent dreu-agent/ dir to sys.path)
 from DiscoveryTask import DiscoveryTask
 from eval_harness import (evaluate_feature_map, load_dataset,
                           SEED_FEATURE_MAPS as _BASE_SEED_MAPS)
@@ -273,13 +275,13 @@ def write_plot_config(plot_dir: str, **extra) -> str:
 # ---------------------------------------------------------------------------
 # Measured seed baselines: shown to the agent (in the seed library AND the
 # generate system prompt) as "the number to beat". Values below are for the
-# config in SEED_BASELINE_CONFIG; refresh with `python qml_task.py baselines`
+# config in SEED_BASELINE_CONFIG; refresh with `python classification_task.py baselines`
 # (the quantum-kernel eval is cheap, ~1s/seed) whenever dim/kernel/data change.
 # ---------------------------------------------------------------------------
 # NOTE: at dim=2/fidelity the zz_l2 seed already hits accuracy 1.0 (nothing to
 # beat) and classical SVMs score ~0.15-0.25 (the ad_hoc set is classically
 # hard by design). Higher dim (e.g. AGENT_DIM=4) leaves real headroom -- run
-# `python qml_task.py baselines` to refresh for your dim/kernel.
+# `python classification_task.py baselines` to refresh for your dim/kernel.
 SEED_BASELINE_CONFIG = "dim=3, kernel=fidelity, train=80, test=20, seed=12345"
 SEED_BASELINE_STATS = {
     "z_first_order": {"accuracy": 0.45, "qubits": 3, "gates": 6, "depth": 2},
@@ -373,7 +375,7 @@ def compute_seed_baselines(dim: int = QML_DIM, kernel: str = QML_KERNEL,
         chart = save_seed_comparison_chart(
             stats, os.path.join(plot_dir, "seed_comparison.png"), note=config)
         print(f"  [chart] {chart}")
-    print("\n# paste over SEED_BASELINE_STATS in qml_task.py:")
+    print("\n# paste over SEED_BASELINE_STATS in classification_task.py:")
     print(f'SEED_BASELINE_CONFIG = "{config}"')
     print("SEED_BASELINE_STATS = {")
     for n, s in stats.items():

@@ -220,7 +220,7 @@ def evaluate_feature_map(code: str, data=None, device: str | None = None,
         limit the result is marked ok=False with a "not viable" error listing
         the violation(s) -- so an over-budget circuit can never win, yet the
         evaluate call still counts (the agent sees its score AND the overage
-        and must resubmit smaller). Wired by qml_task only when
+        and must resubmit smaller). Wired by classification_task only when
         QML_MINIMIZE_RESOURCES is on.
     """
     try:

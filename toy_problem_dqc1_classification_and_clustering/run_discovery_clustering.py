@@ -1,6 +1,6 @@
 """
 Run the generic AgentPipeline on the DQC1 entropy-clustering DiscoveryTask
-(mirrors run_discovery.py, but the artifact is the feature map inside the
+(mirrors run_discovery_classification.py, but the artifact is the feature map inside the
 DQC1 normalized-trace kernel of dqc1.py and the objective is mean ARI).
 
     # Pick any provider LangChain supports; set the matching API key in .env.
@@ -32,6 +32,7 @@ from langchain_core.tools import tool
 from dotenv import load_dotenv
 load_dotenv()
 
+import _bootstrap  # noqa: F401  (adds parent dreu-agent/ dir to sys.path)
 from AgentPipeline import AgentPipeline
 from clustering_task import (make_clustering_task, classical_baselines,
                              format_classical_report,

@@ -1,6 +1,5 @@
 """
 Run the generic AgentPipeline on the concrete QML feature-map DiscoveryTask
-(mirrors the role of agent_graph.py, but built on the reusable classes).
 
     # Pick any provider LangChain supports; set the matching API key in .env.
     export ANTHROPIC_API_KEY=...            # (or OPENAI_API_KEY, GOOGLE_API_KEY, ...)
@@ -8,7 +7,7 @@ Run the generic AgentPipeline on the concrete QML feature-map DiscoveryTask
     export AGENT_MODEL_PROVIDER=anthropic   # optional; inferred from the id if omitted
     export AGENT_DIM=4
     export AGENT_KERNEL=fidelity
-    python run_discovery.py
+    python run_discovery_classification.py
 
 Optional:
     QML_MINIMIZE_RESOURCES=1   also ask the agent to minimize qubits/gates/depth
@@ -19,7 +18,7 @@ Optional:
 
 Swap make_qml_task(...) for any other DiscoveryTask to discover something else --
 the pipeline itself does not change. Refresh seed baselines after changing
-dim/kernel:  python qml_task.py baselines
+dim/kernel:  python classification_task.py baselines
 """
 
 from __future__ import annotations
@@ -31,8 +30,9 @@ from langchain_core.tools import tool
 from dotenv import load_dotenv
 load_dotenv()
 
+import _bootstrap  # noqa: F401  (adds parent dreu-agent/ dir to sys.path)
 from AgentPipeline import AgentPipeline
-from qml_task import (make_qml_task, classical_baselines, format_classical_report,
+from classification_task import (make_qml_task, classical_baselines, format_classical_report,
                       save_seed_comparison_chart, QML_DIM, QML_KERNEL)
 # RAG / web-search / docs tools (db/agent.py): rag_search hits the local PDF
 # knowledge base (Chroma + OpenAI embeddings), web_search is Tavily, qiskit_docs
@@ -52,7 +52,7 @@ PROVIDER = os.environ.get("AGENT_MODEL_PROVIDER") or None
 EXPLORER_MODEL = os.environ.get("AGENT_EXPLORER_MODEL") or MODEL
 REVIEW_MODEL = os.environ.get("AGENT_REVIEW_MODEL") or MODEL
 DEPLOY_MODEL = os.environ.get("AGENT_DEPLOY_MODEL") or MODEL
-DIM = QML_DIM          # from AGENT_DIM (defined in qml_task, honors .env)
+DIM = QML_DIM          # from AGENT_DIM (defined in classification_task, honors .env)
 KERNEL = QML_KERNEL    # from AGENT_KERNEL
 MAX_ITERS = int(os.environ.get("AGENT_MAX_ITERS", "6"))
 TEMPERATURE = float(os.environ.get("AGENT_TEMPERATURE", "0.4"))
@@ -183,7 +183,7 @@ def print_seed_baselines(pipeline: AgentPipeline, best: dict) -> None:
         note=f"dim={DIM}, kernel={KERNEL}")
     if chart:
         lines.append(f"  [chart] {chart}")
-    lines.append("\n# paste over SEED_BASELINE_STATS in qml_task.py:")
+    lines.append("\n# paste over SEED_BASELINE_STATS in classification_task.py:")
     lines.append("SEED_BASELINE_STATS = {")
     for n, s in stats.items():
         if not n.startswith(">>"):
