@@ -5,6 +5,25 @@ qiskit==2.4.2
 qiskit-machine-learning==0.9.0
 qiskit-aer==0.17.2
 
+# PennyLane + JAX stack for the qml-benchmarks library algorithms
+# (DataReuploading, IQP kernel/variational, ProjectedQuantumKernel, ... from
+# arXiv:2403.07059). Installed alongside qiskit so both families share the env.
+#
+# CRITICAL: JAX must stay <0.11. PennyLane 0.45 imports jax.core symbols
+# (concrete_or_error / is_concrete) that were REMOVED in JAX 0.11.0, so a plain
+# `pip install jax` (newest) breaks every model. jax and jaxlib must match.
+# This pairing (PennyLane 0.45.1 + JAX/jaxlib 0.10.0) is verified working on CPU.
+# For GPU, install `jax[cuda12]==0.10.0` matched to the node's CUDA instead (and
+# beware clashes with the CUDA torch build above); CPU jax is fine for the
+# <=18-qubit statevector sims these models use.
+pennylane==0.45.1
+jax==0.10.0
+jaxlib==0.10.0
+optax==0.2.8
+flax==0.12.8
+pandas==3.0.5
+tqdm==4.69.0
+
 # ML / numerics
 scikit-learn==1.9.0
 numpy==2.4.2
